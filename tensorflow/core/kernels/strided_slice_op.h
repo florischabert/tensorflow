@@ -19,7 +19,9 @@ limitations under the License.
 // Functor definition for StridedSliceOp, must be compilable by nvcc.
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "tensorflow/core/framework/resource_handle.h"
 #include "tensorflow/core/framework/tensor_types.h"
+#include "tensorflow/core/framework/variant_encode_decode.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
@@ -54,6 +56,14 @@ template <typename T, int NDIMS, typename Device>
 struct InitOutput {
   static void run(const Device& d, typename TTypes<T, NDIMS>::Tensor output) {
     output.device(d) = output.constant(T(0));
+  }
+};
+
+template <int NDIMS, typename Device>
+struct InitOutput<ResourceHandle, NDIMS, Device> {
+  static void run(const Device& d,
+                  typename TTypes<ResourceHandle, NDIMS>::Tensor output) {
+    output.device(d) = output.constant(ResourceHandle());
   }
 };
 

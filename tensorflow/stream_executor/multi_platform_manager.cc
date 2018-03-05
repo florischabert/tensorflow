@@ -16,6 +16,7 @@ limitations under the License.
 #include "tensorflow/stream_executor/multi_platform_manager.h"
 
 #include "tensorflow/stream_executor/lib/error.h"
+#include "tensorflow/stream_executor/lib/initialize.h"
 #include "tensorflow/stream_executor/lib/str_util.h"
 #include "tensorflow/stream_executor/lib/stringprintf.h"
 
@@ -44,7 +45,7 @@ namespace gputools {
 
 /* static */ port::StatusOr<Platform*> MultiPlatformManager::PlatformWithName(
     const string& target) {
-  mutex_lock lock(GetPlatformsMutex());
+  tf_shared_lock lock(GetPlatformsMutex());
   auto it = GetPlatformMap()->find(port::Lowercase(target));
 
   if (it == GetPlatformMap()->end()) {
@@ -58,7 +59,7 @@ namespace gputools {
 
 /* static */ port::StatusOr<Platform*> MultiPlatformManager::PlatformWithId(
     const Platform::Id& id) {
-  mutex_lock lock(GetPlatformsMutex());
+  tf_shared_lock lock(GetPlatformsMutex());
   auto it = GetPlatformByIdMap()->find(id);
   if (it == GetPlatformByIdMap()->end()) {
     return port::Status(
@@ -77,3 +78,12 @@ namespace gputools {
 
 }  // namespace gputools
 }  // namespace perftools
+
+REGISTER_MODULE_INITIALIZER(
+    multi_platform_manager,
+    {
+        // Nothing -- this is just a module initializer
+        // definition to reference for sequencing
+        // purposes from Platform subclasses that register
+        // themselves with the MultiPlatformManager.
+    });

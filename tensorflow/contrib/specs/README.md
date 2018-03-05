@@ -25,11 +25,11 @@ is a conjunction of a base layer and the activation. For example, `Fs`
 represents a fully connected layer followed by a sigmoid, whereas `Ft`
 represents a fully connected layer followed by a Tanh.
 
- - `Fx` = slim.fully_connected; x = activation function, one of s/t/r/l/m
- - `Cx` = slim.conv2d; x = activation function, one of s/t/r/l/m
- - `Mp` = slim.max_pool2d
- - `Ap` = slim.avg_pool2d
- - `Bn` = slim.batch_norm
+ - `Fx` = tf.contrib.layers.fully_connected; x = activation function, one of s/t/r/l/m
+ - `Cx` = tf.contrib.layers.conv2d; x = activation function, one of s/t/r/l/m
+ - `Mp` = tf.contrib.layers.max_pool2d
+ - `Ap` = tf.contrib.layers.avg_pool2d
+ - `Bn` = tf.contrib.layers.batch_norm
 
 Nonlinearities (suffixes for C/F, so Cs = convolutional layer + sigmoid):
 
@@ -59,23 +59,12 @@ Reshaping:
  - `Squeeze` = tf.squeeze
  - `Expand` = tf.expand_dims
 
-Multidimensional LSTM:
-
-These are intended as alternatives to 2D convolutions.  For sequence models,
-there will be other modeling primitives.
-
- - `Lstm2` = Fun(lstm2d.separable_lstm)  # 2D-to-2D
- - `Lstm2to1` = Fun(lstm2d.reduce_to_sequence)  # 2D-to-1D
- - `Lstm2to0` = Fun(lstm2d.reduce_to_final)  # 2D-to-vector
- - `Clstm2(n, m)` is a `Cl(n, [3,3])` followed by `Lstm2(m)`
- - `Dws(n)` is a depthwise convolution `Cs(n, [1, 1])`
-
 Other:
 
  - `Id` = identity
- - `Do` = slim.dropout
+ - `Do` = tf.contrib.layers.dropout
  - `Lrn` = tf.nn.local_response_normalization
- - `Unit` = slim.unit_norm
+ - `Unit` = tf.contrib.layers.unit_norm
  - `Conc` is roughly tf.nn.concat
 
 Binding external functions:
