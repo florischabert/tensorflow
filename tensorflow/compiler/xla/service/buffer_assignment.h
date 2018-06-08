@@ -192,6 +192,35 @@ class BufferAllocation {
            !is_thread_local();
   }
 
+  // Add a heap trace which was used to assign slices to logical buffers in this
+  // allocation. A single BufferAllocation may include multiple heap traces
+  // in the case of the temporary block where there is a heap trace per
+  // computation.
+  void AddHeapTrace(const HeapSimulatorTrace& heap_trace) {
+    heap_traces_.push_back(heap_trace);
+  }
+
+  // Return the set of heap traces used to assign slices to logical buffers in
+  // this allocation.
+  const std::vector<HeapSimulatorTrace> HeapTraces() const {
+    return heap_traces_;
+  }
+
+  // Returns the LogicalBuffers which are live at the point of peak memory usage
+  // for this allocation. The point of peak memory usage is the point at which
+  // the total size of all live logical buffers is maximal. If peak memory is
+  // reached at multiple points, the set of logical buffers live at the earliest
+  // maximal point is returned. The vector is stabily sorted by
+  // LogicalBuffer::Index.
+  const std::vector<const LogicalBuffer*>& PeakMemoryLogicalBuffers() const {
+    return peak_buffers_;
+  }
+
+  // Get the number of bytes lost to fragmentation. This is equal to the
+  // difference between the size of the allocation and the size of the maximal
+  // live set.
+  int64 fragmentation_bytes() const { return fragmentation_bytes_; }
+
   bool operator==(const BufferAllocation& other) const {
     return index_ == other.index_;
   }
@@ -257,6 +286,12 @@ class BufferAllocation {
   // Mapping from the set of buffers assigned to this allocation to their
   // logical offsets and sizes.
   tensorflow::gtl::FlatMap<const LogicalBuffer*, OffsetSize> assigned_buffers_;
+
+  int64 fragmentation_bytes_ = 0;
+  std::vector<HeapSimulatorTrace> heap_traces_;
+
+  // Set of buffers live at the point of peak memory usage for this allocation.
+  std::vector<const LogicalBuffer*> peak_buffers_;
 };
 
 // Add stream operators for nicer output of CHECK/RET_CHECK failures.
@@ -380,10 +415,10 @@ class BufferAssignment {
   // Only BufferAssigner can build or modify BufferAssignments.
   friend class BufferAssigner;
 
-  explicit BufferAssignment(const HloModule* module,
-                            std::unique_ptr<BufferLiveness> liveness,
-                            LogicalBuffer::SizeFunction buffer_size,
-                            LogicalBuffer::AlignmentFunction color_alignment)
+  BufferAssignment(const HloModule* module,
+                   std::unique_ptr<BufferLiveness> liveness,
+                   LogicalBuffer::SizeFunction buffer_size,
+                   LogicalBuffer::AlignmentFunction color_alignment)
       : module_(module),
         liveness_(std::move(liveness)),
         buffer_size_(std::move(buffer_size)),
@@ -441,7 +476,6 @@ class BufferAssignment {
   LogicalBuffer::AlignmentFunction color_alignment_;
 
   Stats stats_;
-  std::vector<HeapSimulatorTrace> heap_simulator_traces_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(BufferAssignment);
 };

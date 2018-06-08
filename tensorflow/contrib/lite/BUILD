@@ -6,8 +6,6 @@ licenses(["notice"])  # Apache 2.0
 
 load("//tensorflow/contrib/lite:build_def.bzl", "tflite_copts", "gen_selected_ops")
 
-exports_files(["LICENSE"])
-
 exports_files(glob([
     "testdata/*.bin",
     "testdata/*.pb",
@@ -89,7 +87,20 @@ cc_library(
     hdrs = [
         "builtin_op_data.h",
     ],
+    deps = [":context"],
 )
+
+cc_library(
+    name = "kernel_api",
+    hdrs = [
+        "builtin_op_data.h",
+        "builtin_ops.h",
+        "context.h",
+        "context_util.h",
+    ],
+)
+
+exports_files(["builtin_ops.h"])
 
 cc_library(
     name = "string",
@@ -111,6 +122,7 @@ cc_library(
         "interpreter.cc",
         "model.cc",
         "nnapi_delegate.cc",
+        "op_resolver.cc",
         "optional_debug_tools.cc",
     ],
     hdrs = [
@@ -121,6 +133,7 @@ cc_library(
         "interpreter.h",
         "model.h",
         "nnapi_delegate.h",
+        "op_resolver.h",
         "optional_debug_tools.h",
     ],
     copts = tflite_copts(),
@@ -132,10 +145,12 @@ cc_library(
         ":memory_planner",
         ":schema_fbs_version",
         ":simple_memory_arena",
+        ":util",
+        "//tensorflow/contrib/lite/kernels:eigen_support",
         "//tensorflow/contrib/lite/kernels:gemm_support",
         "//tensorflow/contrib/lite/nnapi:nnapi_lib",
+        "//tensorflow/contrib/lite/profiling:profiler",
         "//tensorflow/contrib/lite/schema:schema_fbs",
-        "//tensorflow/core:lib_platform",
     ],
 )
 
@@ -169,6 +184,7 @@ cc_test(
     deps = [
         ":framework",
         ":string_util",
+        "//tensorflow/contrib/lite/kernels:kernel_util",
         "//tensorflow/contrib/lite/kernels/internal:tensor_utils",
         "//tensorflow/contrib/lite/schema:schema_fbs",
         "//tensorflow/contrib/lite/testing:util",
@@ -220,6 +236,18 @@ cc_test(
     ],
 )
 
+# Test OpResolver.
+cc_test(
+    name = "op_resolver_test",
+    size = "small",
+    srcs = ["op_resolver_test.cc"],
+    deps = [
+        ":framework",
+        "//tensorflow/contrib/lite/testing:util",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
 # Test the C extension API code.
 cc_test(
     name = "context_test",
@@ -227,6 +255,27 @@ cc_test(
     srcs = ["context_test.cc"],
     deps = [
         ":framework",
+        "//tensorflow/contrib/lite/testing:util",
+        "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "util",
+    srcs = ["util.cc"],
+    hdrs = ["util.h"],
+    deps = [
+        ":context",
+    ],
+)
+
+cc_test(
+    name = "util_test",
+    size = "small",
+    srcs = ["util_test.cc"],
+    deps = [
+        ":context",
+        ":util",
         "//tensorflow/contrib/lite/testing:util",
         "@com_google_googletest//:gtest",
     ],
@@ -248,18 +297,3 @@ cc_test(
 #        ],
 #    }),
 #)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-            "downloads",
-            "examples",
-            "gen",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
-)

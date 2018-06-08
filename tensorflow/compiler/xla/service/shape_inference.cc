@@ -52,10 +52,14 @@ UnaryOperation OpcodeToUnaryOperation(HloOpcode opcode) {
       return UNOP_ABS;
     case HloOpcode::kCeil:
       return UNOP_CEIL;
+    case HloOpcode::kClz:
+      return UNOP_CLZ;
     case HloOpcode::kCos:
       return UNOP_COS;
     case HloOpcode::kExp:
       return UNOP_EXP;
+    case HloOpcode::kExpm1:
+      return UNOP_EXPM1;
     case HloOpcode::kFloor:
       return UNOP_FLOOR;
     case HloOpcode::kImag:
@@ -64,6 +68,8 @@ UnaryOperation OpcodeToUnaryOperation(HloOpcode opcode) {
       return UNOP_IS_FINITE;
     case HloOpcode::kLog:
       return UNOP_LOG;
+    case HloOpcode::kLog1p:
+      return UNOP_LOG1P;
     case HloOpcode::kNot:
       return UNOP_NOT;
     case HloOpcode::kNegate:
@@ -166,24 +172,24 @@ bool AllUnique(tensorflow::gtl::ArraySlice<int64> slice) {
   return std::set<int64>(slice.begin(), slice.end()).size() == slice.size();
 }
 
-tensorflow::Status ExpectNotTupleOrOpaque(const Shape& shape,
-                                          tensorflow::StringPiece op_type) {
+Status ExpectNotTupleOrOpaque(const Shape& shape,
+                              tensorflow::StringPiece op_type) {
   if (ShapeUtil::IsTuple(shape)) {
     return InvalidArgument("Expected non-tuple argument for %s, but got %s.",
-                           op_type.ToString().c_str(),
+                           std::string(op_type).c_str(),
                            ShapeUtil::HumanString(shape).c_str());
   } else if (ShapeUtil::IsOpaque(shape)) {
     return InvalidArgument("Expected non-opaque argument for %s, but got %s.",
-                           op_type.ToString().c_str(),
+                           std::string(op_type).c_str(),
                            ShapeUtil::HumanString(shape).c_str());
   } else {
-    return tensorflow::Status::OK();
+    return Status::OK();
   }
 }
 
-tensorflow::Status VerifyReducerShape(const ProgramShape& reducer_shape,
-                                      const Shape& init_value_shape,
-                                      const PrimitiveType& input_element_type) {
+Status VerifyReducerShape(const ProgramShape& reducer_shape,
+                          const Shape& init_value_shape,
+                          const PrimitiveType& input_element_type) {
   if (reducer_shape.parameters_size() != 2) {
     return InvalidArgument(
         "Reduction function must take 2 parameters, but "
@@ -193,7 +199,10 @@ tensorflow::Status VerifyReducerShape(const ProgramShape& reducer_shape,
 
   const Shape& accumulator_shape = reducer_shape.result();
   if (ShapeUtil::Rank(accumulator_shape) != 0) {
-    return InvalidArgument("Reduction function must have rank 0.");
+    return InvalidArgument(
+        "Reduction function must have rank 0 (rank %lld reduction function "
+        "given).",
+        ShapeUtil::Rank(accumulator_shape));
   }
 
   // Check that the accumulator can be passed in as the first argument.
@@ -240,7 +249,7 @@ tensorflow::Status VerifyReducerShape(const ProgramShape& reducer_shape,
         ShapeUtil::HumanString(accumulator_shape).c_str());
   }
 
-  return tensorflow::Status::OK();
+  return Status::OK();
 }
 
 StatusOr<Shape> InferWindowOutputShape(const Shape& base_shape,
@@ -301,12 +310,18 @@ StatusOr<Shape> InferWindowOutputShape(const Shape& base_shape,
 
 /* static */ StatusOr<Shape> ShapeInference::InferUnaryOpShape(
     HloOpcode opcode, const HloInstruction* operand) {
+  return InferUnaryOpShape(opcode, operand->shape());
+}
+
+/* static */ StatusOr<Shape> ShapeInference::InferUnaryOpShape(
+    HloOpcode opcode, const Shape& shape) {
   // There is no copy operation at the proto level, so handle copy explicitly.
-  if (opcode == HloOpcode::kCopy) {
-    return operand->shape();
+  // A domain shape is the same as the input one.
+  if (opcode == HloOpcode::kCopy || opcode == HloOpcode::kDomain) {
+    return shape;
   }
 
-  return InferUnaryOpShape(OpcodeToUnaryOperation(opcode), operand->shape());
+  return InferUnaryOpShape(OpcodeToUnaryOperation(opcode), shape);
 }
 
 /* static */ StatusOr<Shape> ShapeInference::InferUnaryOpShape(
@@ -327,7 +342,9 @@ StatusOr<Shape> InferWindowOutputShape(const Shape& base_shape,
     case UNOP_COS:
     case UNOP_SIN:
     case UNOP_EXP:
+    case UNOP_EXPM1:
     case UNOP_LOG:
+    case UNOP_LOG1P:
     case UNOP_TANH:
       if (!ShapeUtil::ElementIsFloating(arg) &&
           !ShapeUtil::ElementIsComplex(arg)) {
@@ -352,6 +369,7 @@ StatusOr<Shape> InferWindowOutputShape(const Shape& base_shape,
             arg, primitive_util::ComplexComponentType(arg.element_type()));
       }
       return arg;
+    case UNOP_CLZ:
     case UNOP_NEGATE:
     case UNOP_ROUND_NEAREST_AFZ:
     case UNOP_SIGN:
@@ -942,6 +960,13 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
 }
 
 /* static */ StatusOr<Shape> ShapeInference::InferBinaryOpShape(
+    HloOpcode opcode, const Shape& lhs, const Shape& rhs,
+    tensorflow::gtl::ArraySlice<int64> broadcast_dimensions) {
+  return InferBinaryOpShape(OpcodeToBinaryOperation(opcode), lhs, rhs,
+                            broadcast_dimensions);
+}
+
+/* static */ StatusOr<Shape> ShapeInference::InferBinaryOpShape(
     BinaryOperation operation, const Shape& lhs, const Shape& rhs,
     tensorflow::gtl::ArraySlice<int64> broadcast_dimensions) {
   VLOG(2) << tensorflow::strings::Printf(
@@ -1023,8 +1048,12 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
 /* static */ StatusOr<Shape> ShapeInference::InferTernaryOpShape(
     HloOpcode opcode, const HloInstruction* lhs, const HloInstruction* rhs,
     const HloInstruction* ehs) {
-  return InferTernaryOpShape(OpcodeToTernaryOperation(opcode), lhs->shape(),
-                             rhs->shape(), ehs->shape());
+  return InferTernaryOpShape(opcode, lhs->shape(), rhs->shape(), ehs->shape());
+}
+
+/* static */ StatusOr<Shape> ShapeInference::InferTernaryOpShape(
+    HloOpcode opcode, const Shape& lhs, const Shape& rhs, const Shape& ehs) {
+  return InferTernaryOpShape(OpcodeToTernaryOperation(opcode), lhs, rhs, ehs);
 }
 
 /* static */ StatusOr<Shape> ShapeInference::InferTernaryOpShape(
@@ -1051,6 +1080,12 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
   for (const HloInstruction* operand : operands) {
     operand_shapes.push_back(&operand->shape());
   }
+  return InferVariadicOpShape(opcode, operand_shapes);
+}
+
+/* static */ StatusOr<Shape> ShapeInference::InferVariadicOpShape(
+    HloOpcode opcode,
+    tensorflow::gtl::ArraySlice<const Shape*> operand_shapes) {
   return InferVariadicOpShape(OpcodeToVariadicOperation(opcode),
                               operand_shapes);
 }
@@ -1184,11 +1219,11 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
       scale_shape, "scale input of batch norm training"));
 
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(operand_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(offset_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(scale_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
 
   if (feature_index >= ShapeUtil::Rank(operand_shape)) {
     return InvalidArgument(
@@ -1290,15 +1325,15 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
       scale_shape, "scale input of batch norm inference"));
 
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(operand_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(offset_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(scale_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(mean_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
   TF_RET_CHECK(ShapeUtil::ValidateShapeWithOptionalLayout(variance_shape) ==
-               tensorflow::Status::OK());
+               Status::OK());
 
   if (feature_index >= ShapeUtil::Rank(operand_shape)) {
     return InvalidArgument(
@@ -2092,8 +2127,8 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
   const int64 start_num_dims = start_indices_shape.dimensions(0);
   if (ShapeUtil::Rank(operand_shape) != start_num_dims) {
     return InvalidArgument(
-        "Dynamic slice start number of dimensions %lld (%s) must match rank "
-        "%lld of slice input (%s).",
+        "Dynamic update slice start number of dimensions %lld (%s) must match "
+        "rank %lld of slice input (%s).",
         start_num_dims, ShapeUtil::HumanString(start_indices_shape).c_str(),
         ShapeUtil::Rank(operand_shape),
         ShapeUtil::HumanString(operand_shape).c_str());
@@ -2394,7 +2429,8 @@ ShapeInference::InferDegenerateDimensionBroadcastShape(
         "Select's pred operand must have PRED element type; got %s.",
         ShapeUtil::HumanString(pred).c_str());
   }
-  if (ShapeUtil::SameDimensions(pred, on_true) || ShapeUtil::Rank(pred) == 0) {
+  if (ShapeUtil::CompatibleIgnoringElementType(pred, on_true) ||
+      ShapeUtil::Rank(pred) == 0) {
     // By this stage we know that pred's element type is PRED. Therefore, this
     // check restricts pred to be a PRED scalar, or a PRED array with the same
     // dimensions as on_true and on_false.

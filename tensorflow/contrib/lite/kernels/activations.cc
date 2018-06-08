@@ -55,7 +55,7 @@ void Free(TfLiteContext* context, void* buffer) {
 TfLiteStatus GenericPrepare(TfLiteContext* context, TfLiteNode* node) {
   TF_LITE_ENSURE_EQ(context, NumInputs(node), 1);
   TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   TF_LITE_ENSURE_EQ(context, input->type, output->type);
 
@@ -68,7 +68,7 @@ TfLiteStatus TanhPrepare(TfLiteContext* context, TfLiteNode* node) {
 
   TF_LITE_ENSURE_EQ(context, NumInputs(node), 1);
   TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   TF_LITE_ENSURE_EQ(context, input->type, output->type);
 
@@ -95,7 +95,7 @@ TfLiteStatus SigmoidPrepare(TfLiteContext* context, TfLiteNode* node) {
 
   TF_LITE_ENSURE_EQ(context, NumInputs(node), 1);
   TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   TF_LITE_ENSURE_EQ(context, input->type, output->type);
 
@@ -126,7 +126,7 @@ TfLiteStatus SoftmaxPrepare(TfLiteContext* context, TfLiteNode* node) {
 
   TF_LITE_ENSURE_EQ(context, NumInputs(node), 1);
   TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   TF_LITE_ENSURE_EQ(context, input->type, output->type);
 
@@ -150,8 +150,36 @@ TfLiteStatus SoftmaxPrepare(TfLiteContext* context, TfLiteNode* node) {
                                TfLiteIntArrayCopy(input->dims));
 }
 
+TfLiteStatus PreluPrepare(TfLiteContext* context, TfLiteNode* node) {
+  TF_LITE_ENSURE_EQ(context, NumInputs(node), 2);
+  TF_LITE_ENSURE_EQ(context, NumOutputs(node), 1);
+  const TfLiteTensor* input = GetInput(context, node, 0);
+  TfLiteTensor* output = GetOutput(context, node, 0);
+  const TfLiteTensor* alpha = GetInput(context, node, 1);
+
+  output->type = input->type;
+
+  // Currently only Float32 is supported
+  // TODO(ycling): Support other data types.
+  TF_LITE_ENSURE_EQ(context, input->type, kTfLiteFloat32);
+  TF_LITE_ENSURE_EQ(context, alpha->type, kTfLiteFloat32);
+
+  // Currently, only support 4D `input` and 3D `alpha` with shape
+  // (1, 1, channels).
+  // TODO(impjdi): Support other cases where `alpha` is broadcastable
+  // to `input`.
+  TF_LITE_ENSURE_EQ(context, input->dims->size, 4);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->size, 3);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->data[0], 1);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->data[1], 1);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->data[2], input->dims->data[3]);
+
+  return context->ResizeTensor(context, output,
+                               TfLiteIntArrayCopy(input->dims));
+}
+
 TfLiteStatus ReluEval(TfLiteContext* context, TfLiteNode* node) {
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   switch (input->type) {
     case kTfLiteFloat32: {
@@ -163,13 +191,14 @@ TfLiteStatus ReluEval(TfLiteContext* context, TfLiteNode* node) {
       return kTfLiteOk;
     } break;
     default:
-      context->ReportError(context, "Only float32 supported currently.");
+      context->ReportError(context, "Only float32 supported currently, got %d.",
+                           input->type);
       return kTfLiteError;
   }
 }
 
 TfLiteStatus Relu1Eval(TfLiteContext* context, TfLiteNode* node) {
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   switch (input->type) {
     case kTfLiteFloat32: {
@@ -183,13 +212,14 @@ TfLiteStatus Relu1Eval(TfLiteContext* context, TfLiteNode* node) {
       return kTfLiteOk;
     } break;
     default:
-      context->ReportError(context, "Only float32 supported currently.");
+      context->ReportError(context, "Only float32 supported currently, got %d.",
+                           input->type);
       return kTfLiteError;
   }
 }
 
 TfLiteStatus Relu6Eval(TfLiteContext* context, TfLiteNode* node) {
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   switch (input->type) {
     case kTfLiteFloat32: {
@@ -201,14 +231,15 @@ TfLiteStatus Relu6Eval(TfLiteContext* context, TfLiteNode* node) {
       return kTfLiteOk;
     } break;
     default:
-      context->ReportError(context, "Only float32 supported currently.");
+      context->ReportError(context, "Only float32 supported currently, got %d.",
+                           input->type);
       return kTfLiteError;
   }
 }
 
 TfLiteStatus TanhEval(TfLiteContext* context, TfLiteNode* node) {
   OpData* data = reinterpret_cast<OpData*>(node->user_data);
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   switch (input->type) {
     case kTfLiteFloat32: {
@@ -228,7 +259,8 @@ TfLiteStatus TanhEval(TfLiteContext* context, TfLiteNode* node) {
       return kTfLiteOk;
     } break;
     default:
-      context->ReportError(context, "Only float32 supported currently.");
+      context->ReportError(context, "Only float32 supported currently, got %d.",
+                           input->type);
       return kTfLiteError;
   }
 }
@@ -237,7 +269,7 @@ TfLiteStatus TanhEval(TfLiteContext* context, TfLiteNode* node) {
 TfLiteStatus SigmoidEval(TfLiteContext* context, TfLiteNode* node) {
   OpData* data = reinterpret_cast<OpData*>(node->user_data);
 
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   switch (input->type) {
     case kTfLiteFloat32: {
@@ -257,14 +289,15 @@ TfLiteStatus SigmoidEval(TfLiteContext* context, TfLiteNode* node) {
       break;
     }
     default:
-      context->ReportError(context, "Only float32 supported currently.");
+      context->ReportError(context, "Only float32 supported currently, got %d.",
+                           input->type);
       return kTfLiteError;
   }
   return kTfLiteOk;
 }
 
 // Takes a 2D tensor and perform softmax along the second dimension.
-void Softmax2DFloat(TfLiteTensor* input, TfLiteTensor* output,
+void Softmax2DFloat(const TfLiteTensor* input, TfLiteTensor* output,
                     TfLiteSoftmaxParams* params) {
   const int batch_size = input->dims->data[0];
   const int input_size = input->dims->data[1];
@@ -299,7 +332,7 @@ void Softmax2DFloat(TfLiteTensor* input, TfLiteTensor* output,
   }
 }
 
-void Softmax2DQuantized(TfLiteTensor* input, TfLiteTensor* output,
+void Softmax2DQuantized(const TfLiteTensor* input, TfLiteTensor* output,
                         TfLiteSoftmaxParams* params, OpData* data) {
   // TODO(ahentz): this is arguably a dirty trick. Since the implementation
   // always traverses the last dimension of a 4D tensor, we will pretend our 2D
@@ -315,14 +348,14 @@ void Softmax2DQuantized(TfLiteTensor* input, TfLiteTensor* output,
 }
 
 // Takes a 4D tensor and perform softmax along the forth dimension.
-void Softmax4DFloat(TfLiteTensor* input, TfLiteTensor* output,
+void Softmax4DFloat(const TfLiteTensor* input, TfLiteTensor* output,
                     TfLiteSoftmaxParams* params) {
   optimized_ops::Softmax(GetTensorData<float>(input), GetTensorDims(input),
                          params->beta, GetTensorData<float>(output),
                          GetTensorDims(output));
 }
 
-void Softmax4DQuantized(TfLiteTensor* input, TfLiteTensor* output,
+void Softmax4DQuantized(const TfLiteTensor* input, TfLiteTensor* output,
                         TfLiteSoftmaxParams* params, OpData* data) {
   optimized_ops::Softmax(GetTensorData<uint8_t>(input), GetTensorDims(input),
                          data->input_multiplier, data->input_left_shift,
@@ -334,7 +367,7 @@ TfLiteStatus SoftmaxEval(TfLiteContext* context, TfLiteNode* node) {
   auto* params = reinterpret_cast<TfLiteSoftmaxParams*>(node->builtin_data);
   OpData* data = reinterpret_cast<OpData*>(node->user_data);
 
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
 
   // TODO(ahentz): consider an implementation that works for many (all?)
@@ -349,8 +382,9 @@ TfLiteStatus SoftmaxEval(TfLiteContext* context, TfLiteNode* node) {
         Softmax4DFloat(input, output, params);
         return kTfLiteOk;
       }
-      context->ReportError(context,
-                           "Only 2D and 4D tensors supported currently.");
+      context->ReportError(
+          context, "Only 2D and 4D tensors supported currently, got %dD.",
+          NumDimensions(input));
       return kTfLiteError;
     }
     case kTfLiteUInt8: {
@@ -362,19 +396,21 @@ TfLiteStatus SoftmaxEval(TfLiteContext* context, TfLiteNode* node) {
         Softmax4DQuantized(input, output, params, data);
         return kTfLiteOk;
       }
-      context->ReportError(context,
-                           "Only 2D and 4D tensors supported currently.");
+      context->ReportError(
+          context, "Only 2D and 4D tensors supported currently, got %dD.",
+          NumDimensions(input));
       return kTfLiteError;
     }
     default:
-      context->ReportError(context,
-                           "Only float32 and uint8_t supported currently.");
+      context->ReportError(
+          context, "Only float32 and uint8_t supported currently, got %d.",
+          input->type);
       return kTfLiteError;
   }
 }
 
 TfLiteStatus LogSoftmaxEval(TfLiteContext* context, TfLiteNode* node) {
-  TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* input = GetInput(context, node, 0);
   TfLiteTensor* output = GetOutput(context, node, 0);
   switch (input->type) {
     case kTfLiteFloat32:
@@ -383,9 +419,40 @@ TfLiteStatus LogSoftmaxEval(TfLiteContext* context, TfLiteNode* node) {
           GetTensorData<float>(output), GetTensorDims(output));
       return kTfLiteOk;
     default:
-      context->ReportError(context, "Only float32 supported currently.");
+      context->ReportError(context, "Only float32 supported currently., got %d",
+                           input->type);
       return kTfLiteError;
   }
+}
+
+TfLiteStatus PreluEval(TfLiteContext* context, TfLiteNode* node) {
+  const TfLiteTensor* input = GetInput(context, node, 0);
+  const TfLiteTensor* alpha = GetInput(context, node, 1);
+  const TfLiteTensor* output = GetOutput(context, node, 0);
+
+  if (input->type != kTfLiteFloat32) {
+    context->ReportError(context, "Only float32 supported currently, got %d.",
+                         input->type);
+    return kTfLiteError;
+  }
+  TF_LITE_ENSURE_EQ(context, input->dims->size, 4);
+  const int batches = input->dims->data[0];
+  const int height = input->dims->data[1];
+  const int width = input->dims->data[2];
+  const int channels = input->dims->data[3];
+
+  TF_LITE_ENSURE_EQ(context, alpha->dims->size, 3);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->data[0], 1);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->data[1], 1);
+  TF_LITE_ENSURE_EQ(context, alpha->dims->data[2], channels);
+
+  const int n = batches * height * width * channels;
+  for (int i = 0; i < n; ++i) {
+    const float x = input->data.f[i];
+    output->data.f[i] = x >= 0.0f ? x : alpha->data.f[i % channels] * x;
+  }
+
+  return kTfLiteOk;
 }
 
 }  // namespace activations
@@ -436,6 +503,13 @@ TfLiteRegistration* Register_LOG_SOFTMAX() {
   static TfLiteRegistration r = {activations::Init, activations::Free,
                                  activations::GenericPrepare,
                                  activations::LogSoftmaxEval};
+  return &r;
+}
+
+TfLiteRegistration* Register_PRELU() {
+  static TfLiteRegistration r = {/*init=*/nullptr, /*free=*/nullptr,
+                                 activations::PreluPrepare,
+                                 activations::PreluEval};
   return &r;
 }
 

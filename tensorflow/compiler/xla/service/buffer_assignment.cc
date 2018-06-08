@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/map_util.h"
 #include "tensorflow/compiler/xla/ptr_util.h"
+#include "tensorflow/compiler/xla/service/buffer_value_containers.h"
 #include "tensorflow/compiler/xla/service/heap_simulator.h"
 #include "tensorflow/compiler/xla/service/hlo.pb.h"
 #include "tensorflow/compiler/xla/service/hlo_opcode.h"
@@ -134,6 +135,7 @@ Status GatherComputationsByAllocationType(
             worklist.push_back(std::make_pair(subcomputation,
                                               false));  // Not thread local.
             break;
+          case HloOpcode::kCrossReplicaSum:
           case HloOpcode::kMap:
           case HloOpcode::kReduce:
           case HloOpcode::kReduceWindow:
@@ -504,6 +506,7 @@ BufferAllocation* BufferAssignment::NewAllocation(const LogicalBuffer& buffer,
   BufferAllocation* allocation =
       NewEmptyAllocation(size, is_thread_local, is_reusable, buffer.color());
   AddAssignment(allocation, buffer, /*offset=*/0, size);
+  allocation->peak_buffers_.push_back(&buffer);
   return allocation;
 }
 
@@ -525,6 +528,7 @@ void BufferAssignment::AddAssignment(BufferAllocation* allocation,
 // Combines allocations of temporary buffers of the same color into one big
 // BufferAllocation.
 void BufferAssignment::CombineTempAllocations() {
+  VLOG(1) << "CombineTempAllocations()";
   FlatMap<LogicalBuffer::Color, BufferAllocation, LogicalBuffer::Color::Hasher>
       combined_allocation_map;
 
@@ -546,11 +550,16 @@ void BufferAssignment::CombineTempAllocations() {
       if (combined_it == combined_allocation_map.end()) {
         // We have found the first temp allocation of this color. Collect
         // the other temp allocations of the same color into it.
+        VLOG(1) << "Combined temp allocation for color " << color
+                << " is: " << temp_allocation;
         combined_allocation_map.emplace(color, temp_allocation);
         continue;
       }
 
       auto* combined_allocation = &combined_it->second;
+      VLOG(1) << "Combined allocation absorbing temp allocation: "
+              << temp_allocation;
+
       // Each temp allocation is placed end-to-end, accounting for alignment.
       // The offset of each buffer in the combined allocation is computed from
       // the base offset of the allocation.
@@ -564,6 +573,14 @@ void BufferAssignment::CombineTempAllocations() {
         const int64 size = buffer_offset_size.second.size;
         combined_allocation->AddAssignment(*buffer, base + offset, size);
       }
+      if (!temp_allocation.HeapTraces().empty()) {
+        CHECK_EQ(temp_allocation.HeapTraces().size(), 1);
+        combined_allocation->AddHeapTrace(temp_allocation.HeapTraces().front());
+      }
+      combined_allocation->peak_buffers_.insert(
+          combined_allocation->peak_buffers_.end(),
+          temp_allocation.peak_buffers_.begin(),
+          temp_allocation.peak_buffers_.end());
     }
     // Replace all existing temporary allocations with the new combined
     // allocations.
@@ -684,7 +701,7 @@ BufferAssignmentProto BufferAssignment::ToProto() const {
         BufferAssignmentProto::BufferAlias* proto_alias =
             proto.add_buffer_aliases();
         LogicalBufferProto::Location proto_alias_location =
-            LogicalBuffer::ToLocationProto(*alias.instruction(), alias.index());
+            BufferValue::ToLocationProto(*alias.instruction(), alias.index());
         proto_alias->set_source_buffer_id(buffer.id());
         proto_alias->mutable_location()->Swap(&proto_alias_location);
       }
@@ -693,9 +710,9 @@ BufferAssignmentProto BufferAssignment::ToProto() const {
   for (const BufferAllocation& allocation : Allocations()) {
     BufferAllocationProto proto_allocation = allocation.ToProto();
     proto.add_buffer_allocations()->Swap(&proto_allocation);
-  }
-  for (const HeapSimulatorTrace& trace : heap_simulator_traces_) {
-    *proto.add_heap_simulator_traces() = trace;
+    for (const HeapSimulatorTrace& heap_trace : allocation.HeapTraces()) {
+      *proto.add_heap_simulator_traces() = heap_trace;
+    }
   }
   return proto;
 }
@@ -1068,7 +1085,9 @@ Status BufferAssigner::AssignBuffersWithSequentialOrdering(
       VLOG(2) << "Simulating heap for color " << color;
       int64 alignment = assignment->color_alignment_(color);
       HeapSimulator::Options options;
-      options.buffers_to_assign = &single_colored_set.second;
+      BufferValueFlatSet buffer_value_set =
+          ToBufferValueFlatSet(single_colored_set.second);
+      options.buffers_to_assign = &buffer_value_set;
       TF_ASSIGN_OR_RETURN(
           const HeapSimulator::Result result,
           HeapSimulator::Run(MakeUnique<DecreasingSizeRunsHeap>(
@@ -1096,7 +1115,9 @@ Status BufferAssigner::AssignBuffersWithSequentialOrdering(
         VLOG(2) << "Simulating heap for color " << color;
         int64 alignment = assignment->color_alignment_(color);
         HeapSimulator::Options options;
-        options.buffers_to_assign = &single_colored_set.second;
+        BufferValueFlatSet buffer_value_set =
+            ToBufferValueFlatSet(single_colored_set.second);
+        options.buffers_to_assign = &buffer_value_set;
         TF_ASSIGN_OR_RETURN(
             const HeapSimulator::Result result,
             HeapSimulator::Run(MakeUnique<DecreasingSizeRunsHeap>(
@@ -1112,6 +1133,89 @@ Status BufferAssigner::AssignBuffersWithSequentialOrdering(
   return Status::OK();
 }
 
+namespace {
+
+// Computes and returns the set of logical buffers live at the point of maximal
+// liveness in the given heap trace. LogicalBuffers are (stabily) sorted by id.
+std::vector<const LogicalBuffer*> ComputePeakMemoryLogicalBuffers(
+    const BufferAllocation& allocation, const HeapSimulatorTrace& heap_trace) {
+  // Create a map from LogicalBuffer::Id to LogicalBuffer* for the logical
+  // buffers in this allocation.
+  tensorflow::gtl::FlatMap<LogicalBuffer::Id, const LogicalBuffer*>
+      id_to_buffer;
+  tensorflow::gtl::FlatMap<const LogicalBuffer*, int64> buffer_sizes;
+  for (const auto& pair : allocation.assigned_buffers()) {
+    const LogicalBuffer* buffer = pair.first;
+    const BufferAllocation::OffsetSize& offset_size = pair.second;
+    id_to_buffer[buffer->id()] = buffer;
+    buffer_sizes[buffer] = offset_size.size;
+  }
+
+  // Returns how much the given event increases the total size of live
+  // buffers. Can be negative.
+  auto memory_delta = [&id_to_buffer, &buffer_sizes](
+                          const HeapSimulatorTrace::Event& event) -> int64 {
+    const LogicalBuffer* buffer = id_to_buffer.at(event.buffer_id());
+    const int64 buffer_size = buffer_sizes.at(buffer);
+    if (event.kind() == HeapSimulatorTrace::Event::ALLOC) {
+      return buffer_size;
+    } else if (event.kind() == HeapSimulatorTrace::Event::SHARE_WITH) {
+      // Sharing a buffer does not change the live set size for the purposes of
+      // the heap simulator. Even though the shared-with buffer may be smaller,
+      // the entire allocation remains live.
+      return 0;
+    } else if (event.kind() == HeapSimulatorTrace::Event::FREE) {
+      return -1 * buffer_size;
+    }
+    LOG(FATAL) << "Unknown event kind: " << event.kind();
+  };
+
+  // First compute the size of the maximal live set.
+  int64 max_live_size = 0;
+  int64 live_size = 0;
+  for (const auto& event : heap_trace.events()) {
+    live_size += memory_delta(event);
+    if (max_live_size < live_size) {
+      max_live_size = live_size;
+    }
+  }
+
+  // Next gather the set of logical buffers live at the earliest point of
+  // maximal live set size.
+  tensorflow::gtl::FlatSet<const LogicalBuffer*> live_buffers;
+  live_size = 0;
+  for (const auto& event : heap_trace.events()) {
+    const LogicalBuffer* buffer = id_to_buffer.at(event.buffer_id());
+    if (event.kind() == HeapSimulatorTrace::Event::ALLOC) {
+      InsertOrDie(&live_buffers, buffer);
+    } else if (event.kind() == HeapSimulatorTrace::Event::SHARE_WITH) {
+      // Nothing to do.
+    } else if (event.kind() == HeapSimulatorTrace::Event::FREE) {
+      CHECK(ContainsKey(live_buffers, buffer));
+      live_buffers.erase(buffer);
+    }
+
+    live_size += memory_delta(event);
+    if (live_size == max_live_size) {
+      break;
+    }
+  }
+  CHECK_EQ(live_size, max_live_size);
+
+  std::vector<const LogicalBuffer*> live_buffers_vector;
+  live_buffers_vector.insert(live_buffers_vector.end(), live_buffers.begin(),
+                             live_buffers.end());
+
+  // Stabily sort the live buffers.
+  std::sort(live_buffers_vector.begin(), live_buffers_vector.end(),
+            [](const LogicalBuffer* a, const LogicalBuffer* b) {
+              return a->id() < b->id();
+            });
+  return live_buffers_vector;
+}
+
+}  // namespace
+
 void BufferAssigner::AssignBuffersFromHeapSimulator(
     const HeapSimulator::Result& result, BufferAssignment* assignment,
     LogicalBuffer::Color color) {
@@ -1126,12 +1230,18 @@ void BufferAssigner::AssignBuffersFromHeapSimulator(
   BufferAllocation* allocation = assignment->NewEmptyAllocation(
       result.heap_size, /*is_thread_local=*/false, /*is_reusable=*/true, color);
   for (const auto& buffer_chunk : result.chunk_map) {
-    const LogicalBuffer& buffer = *buffer_chunk.first;
+    // TODO(lauj) Remove this down_cast after downstream users of
+    // BufferAllocation::assigned_buffers() are updated to use BufferValue.
+    const LogicalBuffer& buffer =
+        *CHECK_NOTNULL(dynamic_cast<const LogicalBuffer*>(buffer_chunk.first));
     const HeapSimulator::Chunk& chunk = buffer_chunk.second;
     assignment->AddAssignment(allocation, buffer, chunk.offset, chunk.size);
   }
+  allocation->peak_buffers_ =
+      ComputePeakMemoryLogicalBuffers(*allocation, result.debug_trace);
 
-  assignment->heap_simulator_traces_.push_back(result.debug_trace);
+  VLOG(1) << "Ran heap simulation for allocation: " << allocation->ToString();
+  allocation->AddHeapTrace(result.debug_trace);
 }
 
 // Adds the 'colocated_set' of buffers to 'colocated_buffer_sets', maintaining
@@ -1222,26 +1332,35 @@ BufferAssigner::MergeColocatedBufferSets(
   auto cannot_merge_buffer_sets = [&colocated_buffer_sets, &buffer_liveness,
                                    &buffer_size,
                                    &is_entry_parameter](int64 i, int64 j) {
-    for (auto& buffer_a : colocated_buffer_sets[i]) {
-      for (auto& buffer_b : colocated_buffer_sets[j]) {
-        // Do not merge if the set includes live outs or entry parameters.
-        if ((buffer_liveness.MaybeLiveOut(*buffer_a) &&
-             is_entry_parameter(*buffer_b)) ||
-            (buffer_liveness.MaybeLiveOut(*buffer_b) &&
-             is_entry_parameter(*buffer_a))) {
-          return true;
-        }
-        // Do not merge if the buffers interfere with each other.
-        if (buffer_a->id() != buffer_b->id() &&
-            buffer_liveness.MayInterfere(*buffer_a, *buffer_b)) {
-          return true;
-        }
-        // Do not merge if the buffer sizes are different.
-        if (buffer_size(*buffer_a) != buffer_size(*buffer_b)) {
+    // Do not merge if one of the sets includes live outs or entry parameters.
+    for (int64 key : {i, j}) {
+      for (auto& buffer : colocated_buffer_sets[key]) {
+        if (buffer_liveness.MaybeLiveOut(*buffer) ||
+            is_entry_parameter(*buffer)) {
           return true;
         }
       }
     }
+
+    // Colocated sets satisfy the invariant that all buffers within a set have
+    // the same size. That means we need to check whether the size is the same
+    // between the two sets, but also that it's enough to look at just one
+    // buffer within each set.
+    if (buffer_size(**colocated_buffer_sets[i].begin()) !=
+        buffer_size(**colocated_buffer_sets[j].begin())) {
+      return true;
+    }
+
+    // Do not merge if some pair of buffers interferes with each other.
+    for (auto& buffer_a : colocated_buffer_sets[i]) {
+      for (auto& buffer_b : colocated_buffer_sets[j]) {
+        if (buffer_a->id() != buffer_b->id() &&
+            buffer_liveness.MayInterfere(*buffer_a, *buffer_b)) {
+          return true;
+        }
+      }
+    }
+
     return false;
   };
 

@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +32,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/ptr_util.h"
 #include "tensorflow/compiler/xla/service/buffer_assignment.h"
 #include "tensorflow/compiler/xla/service/dfs_hlo_visitor.h"
+#include "tensorflow/compiler/xla/service/gpu/backend_configs.pb.h"
 #include "tensorflow/compiler/xla/service/gpu/conditional_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/convolution_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/copy_thunk.h"
@@ -44,6 +47,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/gpu/ir_emission_utils.h"
 #include "tensorflow/compiler/xla/service/gpu/ir_emitter_context.h"
 #include "tensorflow/compiler/xla/service/gpu/kernel_thunk.h"
+#include "tensorflow/compiler/xla/service/gpu/memset_thunk.h"
 #include "tensorflow/compiler/xla/service/gpu/parallel_loop_emitter.h"
 #include "tensorflow/compiler/xla/service/gpu/partition_assignment.h"
 #include "tensorflow/compiler/xla/service/gpu/sequential_thunk.h"
@@ -76,6 +80,7 @@ namespace {
 
 using llvm_ir::IrName;
 using tensorflow::gtl::ArraySlice;
+using tensorflow::gtl::InlinedVector;
 using tensorflow::gtl::nullopt;
 using tensorflow::gtl::optional;
 using tensorflow::strings::StrCat;
@@ -142,37 +147,6 @@ void UpdateLaunchDimensions(const LaunchDimensions& launch_dims, Thunk* thunk,
        llvm::ConstantAsMetadata::get(threads_per_block_ir_value)}));
 }
 
-// Tries to get a Slice for the given instruction at the given index, but
-// returns nullopt if we might not know the slice's address at runtime without
-// dereferencing a containing tuple.
-//
-// In particular, when XLA accepts a parameter of tuple type, the caller has the
-// option of telling XLA what are the values inside of the tuple, or just giving
-// XLA a pointer to the top-level tuple and letting us chase the pointers on the
-// GPU.  We therefore cannot rely having these pointers to parameter sub-buffers
-// being present when we run the program.
-optional<BufferAllocation::Slice> GetKnownAtRuntimeSlice(
-    const HloInstruction* instr, const ShapeIndex& index,
-    const BufferAssignment& buffer_assn) {
-  auto maybe_slice = buffer_assn.GetUniqueSlice(instr, index);
-  if (!maybe_slice.ok()) {
-    return nullopt;
-  }
-  // BufferAllocation gives a slice and alloc to every buffer accessed by XLA,
-  // but we don't necessarily know the runtime address of sub-buffers of input
-  // parameters.
-  const BufferAllocation::Slice& slice = maybe_slice.ValueOrDie();
-  const BufferAllocation* alloc = slice.allocation();
-  if (alloc->IsInputOrOutput() && !alloc->maybe_live_out() &&
-      !alloc->param_shape_index().empty()) {
-    return nullopt;
-  }
-
-  // Otherwise, we will know the address of this slice at runtime without having
-  // to dereference a tuple.
-  return slice;
-}
-
 }  // namespace
 
 IrEmitterUnnested::IrEmitterUnnested(const HloModuleConfig& hlo_module_config,
@@ -203,7 +177,7 @@ bool ImplementedAsHostToDeviceMemcpy(const BufferAssignment& buffer_assignment,
   return hlo.opcode() == HloOpcode::kCopy &&
          hlo.operand(0)->opcode() == HloOpcode::kConstant &&
          ShapeUtil::Equal(hlo.operand(0)->shape(), hlo.shape()) &&
-         GetKnownAtRuntimeSlice(&hlo, {}, buffer_assignment).has_value();
+         buffer_assignment.GetUniqueTopLevelSlice(&hlo).ok();
 }
 
 bool ImplementedAsDeviceToDeviceMemcpy(
@@ -213,13 +187,13 @@ bool ImplementedAsDeviceToDeviceMemcpy(
   //
   // 1. `hlo` is a kCopy instruction.
   // 2. `hlo` and its operand have the same shape (thus the same layout too).
-  // 3. The operand to `hlo` has a buffer assignment (constants do not, for
-  //    instance) which means the source buffer also resides on the device.
+  // 3. `hlo` and its operand have a statically-known buffer assignment
+  //     (constants do not, for instance), which means the source buffer also
+  //     resides on the device.
   return hlo.opcode() == HloOpcode::kCopy &&
          ShapeUtil::Equal(hlo.operand(0)->shape(), hlo.shape()) &&
-         GetKnownAtRuntimeSlice(&hlo, {}, buffer_assignment).has_value() &&
-         GetKnownAtRuntimeSlice(hlo.operand(0), {}, buffer_assignment)
-             .has_value();
+         buffer_assignment.GetUniqueTopLevelSlice(&hlo).ok() &&
+         buffer_assignment.GetUniqueTopLevelSlice(hlo.operand(0)).ok();
 }
 }  // namespace
 
@@ -285,8 +259,39 @@ llvm::Function* IrEmitterUnnested::BuildKernelPrototype(
   return kernel;
 }
 
+namespace {
+// Computes the maximum valid unroll factor for a given instruction.
+int ComputeMaxUnrollFactor(const HloInstruction* hlo) {
+  int max_unroll_factor = hlo->GetModule()
+                              ->config()
+                              .debug_options()
+                              .xla_gpu_max_kernel_unroll_factor();
+
+  // Find the largest possible power of two to unroll by.
+  // TODO(kramerb): Make this smarter.
+  const Shape& element_shape = hlo->IsMultiOutputFusion()
+                                   ? ShapeUtil::GetSubshape(hlo->shape(), {0})
+                                   : hlo->shape();
+  int64 num_elements = ShapeUtil::ElementsIn(element_shape);
+  for (int i = max_unroll_factor; i > 1; i /= 2) {
+    if (num_elements % i == 0) {
+      return i;
+    }
+  }
+
+  // Cannot unroll.
+  return 1;
+}
+}  // namespace
+
 Status IrEmitterUnnested::DefaultAction(HloInstruction* hlo) {
-  thunk_sequence_->emplace_back(BuildKernelThunk(hlo));
+  int unroll_factor = 1;
+  // Unfused elementwise operations are usually memory bound, unroll them.
+  if (hlo->IsElementwise()) {
+    unroll_factor = ComputeMaxUnrollFactor(hlo);
+  }
+
+  thunk_sequence_->emplace_back(BuildKernelThunk(hlo, unroll_factor));
   return IrEmitter::DefaultAction(hlo);
 }
 
@@ -419,15 +424,8 @@ Status IrEmitterUnnested::HandleCustomCall(HloInstruction* custom_call) {
     auto conv_result_slice = assn.GetUniqueSlice(custom_call, {0}).ValueOrDie();
     auto scratch_slice = assn.GetUniqueSlice(custom_call, {1}).ValueOrDie();
 
-    const HloInstruction* algorithm_inst = custom_call->operand(2);
-    CHECK(algorithm_inst->IsConstant()) << algorithm_inst->ToString();
-    int64 algorithm = algorithm_inst->literal().Get<int64>({});
-
-    const HloInstruction* tensor_ops_enabled_inst = custom_call->operand(3);
-    CHECK(tensor_ops_enabled_inst->IsConstant())
-        << tensor_ops_enabled_inst->ToString();
-    bool tensor_ops_enabled = tensor_ops_enabled_inst->literal().Get<bool>({});
-
+    TF_ASSIGN_OR_RETURN(CudnnConvBackendConfig backend_config,
+                        custom_call->backend_config<CudnnConvBackendConfig>());
     const auto& target = custom_call->custom_call_target();
     std::unique_ptr<ConvolutionThunk> thunk;
     if (target == kCudnnConvForwardCallTarget) {
@@ -442,7 +440,8 @@ Status IrEmitterUnnested::HandleCustomCall(HloInstruction* custom_call) {
           /*filter_shape=*/rhs_shape,
           /*output_shape=*/conv_result_shape,  //
           custom_call->window(), custom_call->convolution_dimension_numbers(),
-          algorithm, tensor_ops_enabled, custom_call);
+          backend_config.algorithm(), backend_config.tensor_ops_enabled(),
+          custom_call);
     } else if (target == kCudnnConvBackwardInputCallTarget) {
       thunk = MakeUnique<ConvolutionThunk>(
           CudnnConvKind::kBackwardInput,
@@ -455,7 +454,8 @@ Status IrEmitterUnnested::HandleCustomCall(HloInstruction* custom_call) {
           /*filter_shape=*/rhs_shape,
           /*output_shape=*/lhs_shape,  //
           custom_call->window(), custom_call->convolution_dimension_numbers(),
-          algorithm, tensor_ops_enabled, custom_call);
+          backend_config.algorithm(), backend_config.tensor_ops_enabled(),
+          custom_call);
     } else if (target == kCudnnConvBackwardFilterCallTarget) {
       thunk = MakeUnique<ConvolutionThunk>(
           CudnnConvKind::kBackwardFilter,
@@ -468,7 +468,8 @@ Status IrEmitterUnnested::HandleCustomCall(HloInstruction* custom_call) {
           /*filter_shape=*/conv_result_shape,
           /*output_shape=*/rhs_shape,  //
           custom_call->window(), custom_call->convolution_dimension_numbers(),
-          algorithm, tensor_ops_enabled, custom_call);
+          backend_config.algorithm(), backend_config.tensor_ops_enabled(),
+          custom_call);
     } else {
       LOG(FATAL) << "Unexpected custom call target: "
                  << custom_call->custom_call_target();
@@ -496,14 +497,32 @@ Status IrEmitterUnnested::HandleFusion(HloInstruction* fusion) {
   // initializes the output array to the initial value of the reduce.
   if (HloInstruction::FusionKind::kInput == fusion->fusion_kind()) {
     switch (root->opcode()) {
+      case HloOpcode::kTuple:
       case HloOpcode::kReduce: {
         VLOG(3) << "Emitting fused reduction to vector: " << fusion->ToString();
         std::vector<std::unique_ptr<Thunk>> thunks;
-        thunks.emplace_back(BuildKernelThunk(fusion));
-        TF_RETURN_IF_ERROR(EmitInitializer(
-            fusion, static_cast<KernelThunk*>(thunks.back().get())));
-        bindings_.UnbindAllLocalIrValues();
-        thunks.emplace_back(BuildKernelThunk(fusion));
+        ArraySlice<HloInstruction*> output_instructions =
+            root->opcode() == HloOpcode::kTuple
+                ? root->operands()
+                : ArraySlice<HloInstruction*>(&root, 1);
+
+        // For multi-output fusion emit an initializer for each tuple element.
+        // Otherwise it's sufficient to just initialize the single output.
+        HloInstruction* first_reduce = nullptr;
+        for (int i = 0, e = output_instructions.size(); i != e; ++i) {
+          if (output_instructions[i]->opcode() == HloOpcode::kReduce) {
+            TF_ASSIGN_OR_RETURN(
+                std::unique_ptr<Thunk> initializer_thunk,
+                BuildInitializerThunk(fusion, output_instructions[i] == root
+                                                  ? ShapeIndex()
+                                                  : ShapeIndex({i})));
+            thunks.push_back(std::move(initializer_thunk));
+            first_reduce =
+                first_reduce == nullptr ? output_instructions[i] : first_reduce;
+          }
+        }
+        CHECK(first_reduce != nullptr);
+        thunks.push_back(BuildKernelThunk(fusion));
         thunk_sequence_->emplace_back(
             MakeUnique<SequentialThunk>(std::move(thunks), fusion));
         std::vector<llvm_ir::IrArray> parameter_arrays;
@@ -516,44 +535,50 @@ Status IrEmitterUnnested::HandleFusion(HloInstruction* fusion) {
         FusedIrEmitter fused_emitter(parameter_arrays, &elemental_emitter);
         TF_RETURN_IF_ERROR(root->Accept(&fused_emitter));
 
-        Shape input_shape = root->operand(0)->shape();
-        // EmitReductionToVector requires the input shape to have a layout, but
-        // fused instructions don't have one. So we determine its layout from
-        // the fusion's operands. The choice of the layout only affects
-        // performance but not correctness.
-        auto choose_input_layout = [](
-            tensorflow::gtl::ArraySlice<const HloInstruction*> operands,
-            Shape* input_shape) -> Status {
-          // Prefer the layout of an operand whose shape is compatible with
-          // input_shape.
-          for (const HloInstruction* operand : operands) {
-            if (ShapeUtil::Compatible(*input_shape, operand->shape())) {
-              return LayoutUtil::CopyLayoutBetweenShapes(operand->shape(),
-                                                         input_shape);
-            }
+        // For multi-output fusion CHECK the constraints and feed all the
+        // reduces into a single loop code generator. Single-output reduce
+        // fusion is a special case of that.
+        InlinedVector<llvm_ir::ElementGenerator, 1> input_gens;
+        InlinedVector<llvm_ir::ElementGenerator, 1> init_value_gens;
+        std::vector<std::pair<llvm_ir::ElementGenerator, ShapeIndex>>
+            extra_output_gens;
+        InlinedVector<HloComputation*, 1> reducers;
+        InlinedVector<ShapeIndex, 1> reduce_output_shapes;
+        for (int i = 0, e = output_instructions.size(); i != e; ++i) {
+          const HloInstruction* inst = output_instructions[i];
+          ShapeIndex output_shape_index;
+          if (root->opcode() == HloOpcode::kTuple) {
+            output_shape_index = {i};
           }
-          // If no operand has a compatible shape, prefer an operand that has
-          // the same rank at least.
-          for (const HloInstruction* operand : operands) {
-            if (ShapeUtil::Rank(*input_shape) ==
-                ShapeUtil::Rank(operand->shape())) {
-              // Do not use CopyLayoutBetweenShapes because input_shape and
-              // operand->shape() may be incompatible.
-              *input_shape->mutable_layout() = operand->shape().layout();
-              return Status::OK();
-            }
+          // TODO(kramerb): CHECK that layouts are equal. Currently this
+          // breaks multioutputfusion_test. The test has pre-fused
+          // instructions, but layout_assignment will not assign any layouts
+          // for instructions inside of a fused computation. It just removes
+          // the layouts instead.
+          if (inst->opcode() == HloOpcode::kReduce) {
+            CHECK(ShapeUtil::Compatible(first_reduce->shape(), inst->shape()));
+            CHECK(ShapeUtil::Compatible(first_reduce->operand(0)->shape(),
+                                        inst->operand(0)->shape()));
+            CHECK(ShapeUtil::Compatible(first_reduce->operand(1)->shape(),
+                                        inst->operand(1)->shape()));
+            CHECK(first_reduce->dimensions() == inst->dimensions());
+            input_gens.push_back(fused_emitter.GetGenerator(inst->operand(0)));
+            init_value_gens.push_back(
+                fused_emitter.GetGenerator(inst->operand(1)));
+            reducers.push_back(inst->to_apply());
+            reduce_output_shapes.push_back(std::move(output_shape_index));
+          } else {
+            CHECK(ShapeUtil::Compatible(first_reduce->operand(0)->shape(),
+                                        inst->shape()));
+            extra_output_gens.emplace_back(fused_emitter.GetGenerator(inst),
+                                           std::move(output_shape_index));
           }
-          // When all the above fails, which is rare, set the default layout.
-          LayoutUtil::SetToDefaultLayout(input_shape);
-          return Status::OK();
-        };
-        TF_RETURN_IF_ERROR(
-            choose_input_layout(fusion->operands(), &input_shape));
-
-        return EmitReductionToVector(
-            root, input_shape, fused_emitter.GetGenerator(root->operand(0)),
-            fused_emitter.GetGenerator(root->operand(1)), root->dimensions(),
-            root->to_apply());
+        }
+        const Shape& input_shape = first_reduce->operand(0)->shape();
+        return EmitReductionToVector(first_reduce, input_shape, input_gens,
+                                     init_value_gens,
+                                     first_reduce->dimensions(), reducers,
+                                     reduce_output_shapes, extra_output_gens);
       }
       default:
         LOG(FATAL) << "Bad opcode for input fusion: "
@@ -598,7 +623,11 @@ Status IrEmitterUnnested::HandleFusion(HloInstruction* fusion) {
     thunk_sequence_->emplace_back(BuildGemmThunk(fusion));
     return Status::OK();
   }
-  thunk_sequence_->emplace_back(BuildKernelThunk(fusion));
+
+  CHECK(fusion->fusion_kind() == HloInstruction::FusionKind::kLoop);
+  int unroll_factor = ComputeMaxUnrollFactor(fusion);
+
+  thunk_sequence_->emplace_back(BuildKernelThunk(fusion, unroll_factor));
   return IrEmitter::HandleFusion(fusion);
 }
 
@@ -934,10 +963,33 @@ Status IrEmitterUnnested::HandleCopy(HloInstruction* copy) {
   return IrEmitter::HandleCopy(copy);
 }
 
+Status IrEmitterUnnested::EmitExtraOutputsForReduce(
+    const HloInstruction* reduce, const llvm_ir::IrArray::Index& index,
+    tensorflow::gtl::ArraySlice<
+        std::pair<llvm_ir::ElementGenerator, ShapeIndex>>
+        extra_output_gens) {
+  for (int i = 0; i != extra_output_gens.size(); ++i) {
+    const HloInstruction* output = reduce->parent()->FusionInstruction();
+    llvm::Value* extra_output_address =
+        GetIrArray(*output, *output, extra_output_gens[i].second)
+            .EmitArrayElementAddress(index, &ir_builder_,
+                                     "extra_output_element_address");
+    TF_ASSIGN_OR_RETURN(llvm::Value* const extra_output_ir_value,
+                        extra_output_gens[i].first(index));
+    ir_builder_.CreateStore(extra_output_ir_value, extra_output_address);
+  }
+  return Status::OK();
+}
+
 Status IrEmitterUnnested::EmitReductionToScalar(
     HloInstruction* reduce, const Shape& input_shape,
-    const llvm_ir::ElementGenerator& input_gen,
-    const llvm_ir::ElementGenerator& init_value_gen, HloComputation* reducer) {
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> input_gens,
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> init_value_gens,
+    tensorflow::gtl::ArraySlice<HloComputation*> reducers,
+    tensorflow::gtl::ArraySlice<ShapeIndex> reduce_output_shapes,
+    tensorflow::gtl::ArraySlice<
+        std::pair<llvm_ir::ElementGenerator, ShapeIndex>>
+        extra_output_gens) {
   // Number of elements processed by a single thread.
   constexpr int64 kTileSize = 16;
   int64 num_elems = ShapeUtil::ElementsIn(input_shape);
@@ -989,14 +1041,19 @@ Status IrEmitterUnnested::EmitReductionToScalar(
   //
   auto loop_body_emitter =
       [=](const llvm_ir::IrArray::Index& tile_index) -> Status {
+    const int num_reduces = reducers.size();
     llvm::Type* element_ir_type =
         llvm_ir::PrimitiveTypeToIrType(input_shape.element_type(), module_);
-    llvm::Value* partial_reduction_result_address = ir_builder_.CreateAlloca(
-        element_ir_type, /*ArraySize=*/nullptr, "partial_reduction_result");
-    {
-      TF_ASSIGN_OR_RETURN(llvm::Value * init_ir_value,
-                          init_value_gen(llvm_ir::IrArray::Index({})));
+    std::vector<llvm::Value*> partial_reduction_result_addresses;
+    for (int i = 0; i != num_reduces; ++i) {
+      llvm::Value* partial_reduction_result_address = ir_builder_.CreateAlloca(
+          element_ir_type, /*ArraySize=*/nullptr,
+          "partial_reduction_result." + llvm::Twine(i));
+      TF_ASSIGN_OR_RETURN(llvm::Value* const init_ir_value,
+                          init_value_gens[i](llvm_ir::IrArray::Index({})));
       ir_builder_.CreateStore(init_ir_value, partial_reduction_result_address);
+      partial_reduction_result_addresses.push_back(
+          partial_reduction_result_address);
     }
 
     llvm::Value* x_in_tiles = tile_index[0];
@@ -1029,11 +1086,16 @@ Status IrEmitterUnnested::EmitReductionToScalar(
       llvm_ir::IrArray::Index input_index(
           /*linear=*/x, input_shape, &ir_builder_);
       llvm::Value* input_address = ir_builder_.CreateAlloca(element_ir_type);
-      TF_ASSIGN_OR_RETURN(llvm::Value * input_ir_value, input_gen(input_index));
-      ir_builder_.CreateStore(input_ir_value, input_address);
-      return (EmitCallToNestedComputation(
-          *reducer, {partial_reduction_result_address, input_address},
-          partial_reduction_result_address));
+      for (int i = 0; i != num_reduces; ++i) {
+        TF_ASSIGN_OR_RETURN(llvm::Value* const input_ir_value,
+                            input_gens[i](input_index));
+        ir_builder_.CreateStore(input_ir_value, input_address);
+        TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
+            *reducers[i],
+            {partial_reduction_result_addresses[i], input_address},
+            partial_reduction_result_addresses[i]));
+      }
+      return EmitExtraOutputsForReduce(reduce, input_index, extra_output_gens);
     };
 
     // x_end = kTileSize + x_in_tiles * kTileSize, i.e., the location that's
@@ -1068,20 +1130,24 @@ Status IrEmitterUnnested::EmitReductionToScalar(
                                       : element_ir_type;
     for (int shuffle_distance = kWarpSize / 2; shuffle_distance >= 1;
          shuffle_distance /= 2) {
-      llvm::Value* partial_reduction_result = ir_builder_.CreateLoad(
-          ir_builder_.CreateBitCast(partial_reduction_result_address,
-                                    shuffle_ir_type->getPointerTo()),
-          "partial_reduction_result");
       llvm::Value* result_from_other_lane = ir_builder_.CreateAlloca(
           element_ir_type, nullptr, "result_from_other_lane");
-      ir_builder_.CreateStore(
-          EmitShuffleDown(partial_reduction_result,
-                          ir_builder_.getInt32(shuffle_distance), &ir_builder_),
-          ir_builder_.CreateBitCast(result_from_other_lane,
-                                    shuffle_ir_type->getPointerTo()));
-      TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
-          *reducer, {partial_reduction_result_address, result_from_other_lane},
-          partial_reduction_result_address));
+      for (int i = 0; i != num_reduces; ++i) {
+        llvm::Value* partial_reduction_result = ir_builder_.CreateLoad(
+            ir_builder_.CreateBitCast(partial_reduction_result_addresses[i],
+                                      shuffle_ir_type->getPointerTo()),
+            "partial_reduction_result");
+        ir_builder_.CreateStore(
+            EmitShuffleDown(partial_reduction_result,
+                            ir_builder_.getInt32(shuffle_distance),
+                            &ir_builder_),
+            ir_builder_.CreateBitCast(result_from_other_lane,
+                                      shuffle_ir_type->getPointerTo()));
+        TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
+            *reducers[i],
+            {partial_reduction_result_addresses[i], result_from_other_lane},
+            partial_reduction_result_addresses[i]));
+      }
     }
 
     const HloInstruction* output =
@@ -1097,14 +1163,21 @@ Status IrEmitterUnnested::EmitReductionToScalar(
         "lane_id_is_zero", &ir_builder_);
     llvm_ir::SetToFirstInsertPoint(if_lane_id_is_zero_data.true_block,
                                    &ir_builder_);
-    llvm::Value* output_address =
-        GetIrArray(*output, *output)
-            .EmitArrayElementAddress(
-                llvm_ir::IrArray::Index(/*linear=*/ir_builder_.getInt64(0),
-                                        output->shape(), &ir_builder_),
-                &ir_builder_, "output_element_address");
-    return EmitAtomicOperationForNestedComputation(
-        *reducer, output_address, partial_reduction_result_address);
+
+    for (int i = 0; i != num_reduces; ++i) {
+      llvm::Value* output_address =
+          GetIrArray(*output, *output, reduce_output_shapes[i])
+              .EmitArrayElementAddress(
+                  llvm_ir::IrArray::Index(
+                      /*linear=*/ir_builder_.getInt64(0),
+                      ShapeUtil::GetSubshape(output->shape(),
+                                             reduce_output_shapes[i]),
+                      &ir_builder_),
+                  &ir_builder_, "output_element_address");
+      TF_RETURN_IF_ERROR(EmitAtomicOperationForNestedComputation(
+          *reducers[i], output_address, partial_reduction_result_addresses[i]));
+    }
+    return Status::OK();
   };
 
   // Emit a parallel loop that iterates through all input tiles, one per thread.
@@ -1124,8 +1197,13 @@ Status IrEmitterUnnested::EmitReductionToScalar(
 
 Status IrEmitterUnnested::EmitColumnReduction(
     int64 height, int64 width, HloInstruction* reduce, const Shape& input_shape,
-    const llvm_ir::ElementGenerator& input_gen,
-    const llvm_ir::ElementGenerator& init_value_gen, HloComputation* reducer) {
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> input_gens,
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> init_value_gens,
+    tensorflow::gtl::ArraySlice<HloComputation*> reducers,
+    tensorflow::gtl::ArraySlice<ShapeIndex> reduce_output_shapes,
+    tensorflow::gtl::ArraySlice<
+        std::pair<llvm_ir::ElementGenerator, ShapeIndex>>
+        extra_output_gens) {
   // Divide the input matrix into tiles of size Kx1. For example, when the
   // input matrix is 4x4 and K=2, the tiled matrix looks like
   //
@@ -1135,9 +1213,13 @@ Status IrEmitterUnnested::EmitColumnReduction(
   //   4567  // Numbers indicate tile IDs.
   //
   // Each tile is first partially reduced to a scalar by a thread, and then the
-  // scalar is accumulated to the output vector using atomic operations. We
-  // choose 16 as the tile size, which matches Eigen's ColumnReduceKernel.
-  constexpr int64 kTileSize = 16;
+  // scalar is accumulated to the output vector using atomic operations.
+  //
+  // We choose 128 as the tile size based on empirical evidence. It's big enough
+  // to reduce the amount of atomic adds in the end, maximizing the memory
+  // bandwidth.
+  constexpr int64 kTileSize = 128;
+
   // If the height is not a multiple of the tile size, we pad the bottom of the
   // input matrix.
   const int64 height_in_tiles = CeilOfRatio(height, kTileSize);
@@ -1167,15 +1249,20 @@ Status IrEmitterUnnested::EmitColumnReduction(
   // }
   auto loop_body_emitter =
       [=](const llvm_ir::IrArray::Index& tile_index) -> Status {
+    const int num_reduces = reducers.size();
     // Emit the loop body that reduces one tile.
     llvm::Type* element_ir_type =
         llvm_ir::PrimitiveTypeToIrType(input_shape.element_type(), module_);
-    llvm::Value* partial_reduction_result_address = ir_builder_.CreateAlloca(
-        element_ir_type, /*ArraySize=*/nullptr, "partial_reduction_result");
-    {
-      TF_ASSIGN_OR_RETURN(llvm::Value * init_ir_value,
-                          init_value_gen(llvm_ir::IrArray::Index({})));
+    std::vector<llvm::Value*> partial_reduction_result_addresses;
+    for (int i = 0; i != num_reduces; ++i) {
+      llvm::Value* partial_reduction_result_address = ir_builder_.CreateAlloca(
+          element_ir_type, /*ArraySize=*/nullptr,
+          "partial_reduction_result." + llvm::Twine(i));
+      TF_ASSIGN_OR_RETURN(llvm::Value* const init_ir_value,
+                          init_value_gens[i](llvm_ir::IrArray::Index({})));
       ir_builder_.CreateStore(init_ir_value, partial_reduction_result_address);
+      partial_reduction_result_addresses.push_back(
+          partial_reduction_result_address);
     }
 
     // Emit an inner for-loop that partially reduces the elements in the given
@@ -1233,13 +1320,18 @@ Status IrEmitterUnnested::EmitColumnReduction(
                 .SourceIndexOfTranspose(normalized_input_shape, input_shape,
                                         transpose_dimension_mapping,
                                         &ir_builder_);
-        TF_ASSIGN_OR_RETURN(llvm::Value * input_ir_value,
-                            input_gen(input_index));
-        ir_builder_.CreateStore(input_ir_value, input_address);
+        for (int i = 0; i != num_reduces; ++i) {
+          TF_ASSIGN_OR_RETURN(llvm::Value* const input_ir_value,
+                              input_gens[i](input_index));
+          ir_builder_.CreateStore(input_ir_value, input_address);
+          TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
+              *reducers[i],
+              {partial_reduction_result_addresses[i], input_address},
+              partial_reduction_result_addresses[i]));
+        }
+        return EmitExtraOutputsForReduce(reduce, input_index,
+                                         extra_output_gens);
       }
-      return (EmitCallToNestedComputation(
-          *reducer, {partial_reduction_result_address, input_address},
-          partial_reduction_result_address));
     };
 
     // y_end = kTileSize + y_in_tiles * kTileSize, i.e., the y location that's
@@ -1268,13 +1360,20 @@ Status IrEmitterUnnested::EmitColumnReduction(
                                    &ir_builder_);
     const HloInstruction* output =
         reduce->IsFused() ? reduce->parent()->FusionInstruction() : reduce;
-    llvm::Value* output_address =
-        GetIrArray(*output, *output)
-            .EmitArrayElementAddress(
-                llvm_ir::IrArray::Index(x, output->shape(), &ir_builder_),
-                &ir_builder_, "output_element_address");
-    return EmitAtomicOperationForNestedComputation(
-        *reducer, output_address, partial_reduction_result_address);
+    for (int i = 0; i != num_reduces; ++i) {
+      llvm::Value* output_address =
+          GetIrArray(*output, *output, reduce_output_shapes[i])
+              .EmitArrayElementAddress(
+                  llvm_ir::IrArray::Index(
+                      x,
+                      ShapeUtil::GetSubshape(output->shape(),
+                                             reduce_output_shapes[i]),
+                      &ir_builder_),
+                  &ir_builder_, "output_element_address");
+      TF_RETURN_IF_ERROR(EmitAtomicOperationForNestedComputation(
+          *reducers[i], output_address, partial_reduction_result_addresses[i]));
+    }
+    return Status::OK();
   };
 
   // Emit a parallel loop that iterate through all input tiles.
@@ -1294,8 +1393,14 @@ Status IrEmitterUnnested::EmitColumnReduction(
 
 Status IrEmitterUnnested::EmitRowReduction(
     int64 depth, int64 height, int64 width, HloInstruction* reduce,
-    const Shape& input_shape, const llvm_ir::ElementGenerator& input_gen,
-    const llvm_ir::ElementGenerator& init_value_gen, HloComputation* reducer) {
+    const Shape& input_shape,
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> input_gens,
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> init_value_gens,
+    tensorflow::gtl::ArraySlice<HloComputation*> reducers,
+    tensorflow::gtl::ArraySlice<ShapeIndex> reduce_output_shapes,
+    tensorflow::gtl::ArraySlice<
+        std::pair<llvm_ir::ElementGenerator, ShapeIndex>>
+        extra_output_gens) {
   // A naive algorithm is:
   // 1. Divide the input tensor into tiles of size 1x1xK.
   // 2. Partially reduces each tile to a scalar using one thread.
@@ -1385,15 +1490,20 @@ Status IrEmitterUnnested::EmitRowReduction(
 
   auto loop_body_emitter =
       [=](const llvm_ir::IrArray::Index& tile_index) -> Status {
+    const int num_reduces = reducers.size();
     // Emit the loop body that reduces one tile.
     llvm::Type* element_ir_type = llvm_ir::PrimitiveTypeToIrType(
         input_shape.element_type(), ir_emitter_context_->llvm_module());
-    llvm::Value* partial_reduction_result_address = ir_builder_.CreateAlloca(
-        element_ir_type, /*ArraySize=*/nullptr, "partial_reduction_result");
-    {
-      TF_ASSIGN_OR_RETURN(llvm::Value * init_ir_value,
-                          init_value_gen(llvm_ir::IrArray::Index({})));
+    std::vector<llvm::Value*> partial_reduction_result_addresses;
+    for (int i = 0; i != num_reduces; ++i) {
+      llvm::Value* partial_reduction_result_address = ir_builder_.CreateAlloca(
+          element_ir_type, /*ArraySize=*/nullptr,
+          "partial_reduction_result." + llvm::Twine(i));
+      TF_ASSIGN_OR_RETURN(llvm::Value* const init_ir_value,
+                          init_value_gens[i](llvm_ir::IrArray::Index({})));
       ir_builder_.CreateStore(init_ir_value, partial_reduction_result_address);
+      partial_reduction_result_addresses.push_back(
+          partial_reduction_result_address);
     }
 
     // Emit an inner for-loop that partially reduces the elements in the given
@@ -1476,13 +1586,18 @@ Status IrEmitterUnnested::EmitRowReduction(
                 .SourceIndexOfTranspose(normalized_input_shape, input_shape,
                                         transpose_dimension_mapping,
                                         &ir_builder_);
-        TF_ASSIGN_OR_RETURN(llvm::Value * input_ir_value,
-                            input_gen(input_index));
-        ir_builder_.CreateStore(input_ir_value, input_address);
+        for (int i = 0; i != num_reduces; ++i) {
+          TF_ASSIGN_OR_RETURN(llvm::Value* const input_ir_value,
+                              input_gens[i](input_index));
+          ir_builder_.CreateStore(input_ir_value, input_address);
+          TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
+              *reducers[i],
+              {partial_reduction_result_addresses[i], input_address},
+              partial_reduction_result_addresses[i]));
+        }
+        return EmitExtraOutputsForReduce(reduce, input_index,
+                                         extra_output_gens);
       }
-      return EmitCallToNestedComputation(
-          *reducer, {partial_reduction_result_address, input_address},
-          partial_reduction_result_address);
     };
 
     llvm::Value* tile_in_bounds = ir_builder_.CreateOr(
@@ -1510,20 +1625,24 @@ Status IrEmitterUnnested::EmitRowReduction(
                                       : element_ir_type;
     for (int shuffle_distance = 16; shuffle_distance >= 1;
          shuffle_distance /= 2) {
-      llvm::Value* partial_reduction_result = ir_builder_.CreateLoad(
-          ir_builder_.CreateBitCast(partial_reduction_result_address,
-                                    shuffle_ir_type->getPointerTo()),
-          "partial_reduction_result");
       llvm::Value* result_from_other_lane = ir_builder_.CreateAlloca(
           element_ir_type, nullptr, "result_from_other_lane");
-      ir_builder_.CreateStore(
-          EmitShuffleDown(partial_reduction_result,
-                          ir_builder_.getInt32(shuffle_distance), &ir_builder_),
-          ir_builder_.CreateBitCast(result_from_other_lane,
-                                    shuffle_ir_type->getPointerTo()));
-      TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
-          *reducer, {partial_reduction_result_address, result_from_other_lane},
-          partial_reduction_result_address));
+      for (int i = 0; i != num_reduces; ++i) {
+        llvm::Value* partial_reduction_result = ir_builder_.CreateLoad(
+            ir_builder_.CreateBitCast(partial_reduction_result_addresses[i],
+                                      shuffle_ir_type->getPointerTo()),
+            "partial_reduction_result");
+        ir_builder_.CreateStore(
+            EmitShuffleDown(partial_reduction_result,
+                            ir_builder_.getInt32(shuffle_distance),
+                            &ir_builder_),
+            ir_builder_.CreateBitCast(result_from_other_lane,
+                                      shuffle_ir_type->getPointerTo()));
+        TF_RETURN_IF_ERROR(EmitCallToNestedComputation(
+            *reducers[i],
+            {partial_reduction_result_addresses[i], result_from_other_lane},
+            partial_reduction_result_addresses[i]));
+      }
     }
 
     const HloInstruction* output =
@@ -1537,13 +1656,20 @@ Status IrEmitterUnnested::EmitRowReduction(
         "lane_id_is_zero", &ir_builder_);
     llvm_ir::SetToFirstInsertPoint(if_lane_id_is_zero_data.true_block,
                                    &ir_builder_);
-    llvm::Value* output_address =
-        GetIrArray(*output, *output)
-            .EmitArrayElementAddress(
-                llvm_ir::IrArray::Index(y, output->shape(), &ir_builder_),
-                &ir_builder_, "output_element_address");
-    return EmitAtomicOperationForNestedComputation(
-        *reducer, output_address, partial_reduction_result_address);
+    for (int i = 0; i != num_reduces; ++i) {
+      llvm::Value* output_address =
+          GetIrArray(*output, *output, reduce_output_shapes[i])
+              .EmitArrayElementAddress(
+                  llvm_ir::IrArray::Index(
+                      y,
+                      ShapeUtil::GetSubshape(output->shape(),
+                                             reduce_output_shapes[i]),
+                      &ir_builder_),
+                  &ir_builder_, "output_element_address");
+      TF_RETURN_IF_ERROR(EmitAtomicOperationForNestedComputation(
+          *reducers[i], output_address, partial_reduction_result_addresses[i]));
+    }
+    return Status::OK();
   };
 
   // Emit a parallel loop that iterates through every input tiles.
@@ -1570,10 +1696,14 @@ Status IrEmitterUnnested::EmitRowReduction(
 //               elementwise.
 Status IrEmitterUnnested::EmitReductionToVector(
     HloInstruction* reduce, const Shape& input_shape,
-    const llvm_ir::ElementGenerator& input_gen,
-    const llvm_ir::ElementGenerator& init_value_gen,
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> input_gens,
+    tensorflow::gtl::ArraySlice<llvm_ir::ElementGenerator> init_value_gens,
     tensorflow::gtl::ArraySlice<int64> dimensions_to_reduce,
-    HloComputation* reducer) {
+    tensorflow::gtl::ArraySlice<HloComputation*> reducers,
+    tensorflow::gtl::ArraySlice<ShapeIndex> reduce_output_shapes,
+    tensorflow::gtl::ArraySlice<
+        std::pair<llvm_ir::ElementGenerator, ShapeIndex>>
+        extra_output_gens) {
   // This emission requires "reduce" to have an input layout. It is either set
   // by LayoutAssignment (for a top-level kReduce) or by InstructionFusion (for
   // a fused kReduce).
@@ -1608,8 +1738,9 @@ Status IrEmitterUnnested::EmitReductionToVector(
   // `EmitReductionToVector`, we only need to check whether the minormost
   // dimension of the input is to keep.
   if (input_dims_to_keep.empty()) {
-    return EmitReductionToScalar(reduce, input_shape, input_gen, init_value_gen,
-                                 reducer);
+    return EmitReductionToScalar(reduce, input_shape, input_gens,
+                                 init_value_gens, reducers,
+                                 reduce_output_shapes, extra_output_gens);
   } else if (input_dims_to_keep.front() ==
              LayoutUtil::Minor(input_shape.layout(), 0)) {
     // Column reduction. Treat the result of "input" as a matrix whose width
@@ -1626,8 +1757,9 @@ Status IrEmitterUnnested::EmitReductionToVector(
         height *= input_shape.dimensions(input_dim);
       }
     }
-    return EmitColumnReduction(height, width, reduce, input_shape, input_gen,
-                               init_value_gen, reducer);
+    return EmitColumnReduction(height, width, reduce, input_shape, input_gens,
+                               init_value_gens, reducers, reduce_output_shapes,
+                               extra_output_gens);
   } else {
     // Reduce the row dimension of a matrix or reduce dimension 0 and 2 in a
     // 3D tensor. The size of dimension 1 (the height) is the size of the
@@ -1653,7 +1785,8 @@ Status IrEmitterUnnested::EmitReductionToVector(
     }
     const int64 height = ShapeUtil::ElementsIn(reduce->shape());
     return EmitRowReduction(depth, height, width, reduce, input_shape,
-                            input_gen, init_value_gen, reducer);
+                            input_gens, init_value_gens, reducers,
+                            reduce_output_shapes, extra_output_gens);
   }
 }
 
@@ -1668,25 +1801,24 @@ Status IrEmitterUnnested::HandleReduce(HloInstruction* reduce) {
   if (IsReductionToVector(*reduce) &&
       // NVPTX backend can't do atomic cmpxchg any narrower than 32 bits
       32 <= primitive_util::BitWidth(reduce->shape().element_type())) {
+    TF_ASSIGN_OR_RETURN(std::unique_ptr<Thunk> initializer_thunk,
+                        BuildInitializerThunk(reduce));
     std::vector<std::unique_ptr<Thunk>> thunks;
-    thunks.emplace_back(BuildKernelThunk(reduce));
-    TF_RETURN_IF_ERROR(EmitInitializer(
-        reduce, static_cast<KernelThunk*>(thunks.back().get())));
-    bindings_.UnbindAllLocalIrValues();
-    thunks.emplace_back(BuildKernelThunk(reduce));
+    thunks.push_back(std::move(initializer_thunk));
+    thunks.push_back(BuildKernelThunk(reduce));
     thunk_sequence_->emplace_back(
         MakeUnique<SequentialThunk>(std::move(thunks), reduce));
+
     return EmitReductionToVector(
-        reduce, input->shape(),
-        [&](const llvm_ir::IrArray::Index& index) {
+        reduce, input->shape(), {[&](const llvm_ir::IrArray::Index& index) {
           return GetIrArray(*input, *reduce)
               .EmitReadArrayElement(index, &ir_builder_);
-        },
-        [&](const llvm_ir::IrArray::Index& index) {
+        }},
+        {[&](const llvm_ir::IrArray::Index& index) {
           return GetIrArray(*init_value, *reduce)
               .EmitReadArrayElement(index, &ir_builder_);
-        },
-        dimensions_to_reduce, reducer);
+        }},
+        dimensions_to_reduce, {reducer}, {{}}, {});
   }
 
   thunk_sequence_->emplace_back(BuildKernelThunk(reduce));
@@ -1739,16 +1871,13 @@ Status IrEmitterUnnested::HandleSelectAndScatter(
   CHECK_EQ(rank, ShapeUtil::Rank(source->shape()));
   CHECK_EQ(rank, window.dimensions_size());
 
-  {
-    std::vector<std::unique_ptr<Thunk>> thunks;
-    thunks.emplace_back(BuildKernelThunk(select_and_scatter));
-    TF_RETURN_IF_ERROR(EmitInitializer(
-        select_and_scatter, static_cast<KernelThunk*>(thunks.back().get())));
-    bindings_.UnbindAllLocalIrValues();
-    thunks.emplace_back(BuildKernelThunk(select_and_scatter));
-    thunk_sequence_->emplace_back(
-        MakeUnique<SequentialThunk>(std::move(thunks), select_and_scatter));
-  }
+  TF_ASSIGN_OR_RETURN(std::unique_ptr<Thunk> initializer_thunk,
+                      BuildInitializerThunk(select_and_scatter));
+  std::vector<std::unique_ptr<Thunk>> thunks;
+  thunks.push_back(std::move(initializer_thunk));
+  thunks.push_back(BuildKernelThunk(select_and_scatter));
+  thunk_sequence_->emplace_back(
+      MakeUnique<SequentialThunk>(std::move(thunks), select_and_scatter));
 
   // TODO(b/31410564): Implement dilation rate for select-and-scatter.
   if (window_util::HasDilation(window)) {
@@ -1957,6 +2086,52 @@ Status IrEmitterUnnested::HandleSelect(HloInstruction* select) {
   return IrEmitter::HandleSelect(select);
 }
 
+Status IrEmitterUnnested::HandleCrossReplicaSum(HloInstruction* crs) {
+  if (hlo_module_config_.replica_count() != 1) {
+    // TODO(b/33011107): Support nontrivial cross replica sum on GPU.
+    return Unimplemented(
+        "CrossReplicaSum with >1 replica is not implemented on GPU.");
+  }
+
+  // CRS with one operand and one replica is simply the identity function.
+  // Buffer assignment expects a copy, so that's what we do.
+  //
+  // TODO(b/80100934): We would like to eliminate one-replica CRS nodes entirely
+  // in algebraic-simplifier, but currently on some platforms
+  // HloModuleConfig::num_replicas changes between when the module is compiled
+  // and when it's run.
+  if (crs->operand_count() == 1) {
+    CHECK(ShapeUtil::IsArray(crs->operand(0)->shape()))
+        << "Operands to cross-replica-sum must be arrays: " << crs->ToString();
+    thunk_sequence_->push_back(MakeUnique<DeviceToDeviceCopyThunk>(
+        /*source_address=*/GetAllocationSlice(*crs->operand(0)),
+        /*destination_buffer=*/GetAllocationSlice(*crs),
+        /*mem_size=*/ShapeUtil::ByteSizeOf(crs->shape()), crs));
+    return Status::OK();
+  }
+
+  // One-replica CRS with multiple operands produces a tuple of the inputs.
+  // Again, buffer assignment expects us to copy each.
+  std::vector<std::unique_ptr<Thunk>> thunks;
+  std::vector<BufferAllocation::Slice> tuple_element_buffers;
+  for (int64 i = 0; i < crs->operand_count(); ++i) {
+    tuple_element_buffers.push_back(ir_emitter_context_->buffer_assignment()
+                                        .GetUniqueSlice(crs, {i})
+                                        .ValueOrDie());
+    thunks.push_back(MakeUnique<DeviceToDeviceCopyThunk>(
+        /*source_address=*/GetAllocationSlice(*crs->operand(i)),
+        /*destination_buffer=*/tuple_element_buffers.back(),
+        /*mem_size=*/ShapeUtil::ByteSizeOf(crs->operand(i)->shape()), crs));
+  }
+
+  // Output a tuple of the buffers above.
+  thunks.push_back(MakeUnique<TupleThunk>(tuple_element_buffers,
+                                          GetAllocationSlice(*crs), crs));
+  thunk_sequence_->push_back(
+      MakeUnique<SequentialThunk>(std::move(thunks), crs));
+  return Status::OK();
+}
+
 Status IrEmitterUnnested::HandleInfeed(HloInstruction* infeed) {
   thunk_sequence_->emplace_back(BuildInfeedThunk(infeed));
   return Status::OK();
@@ -1993,38 +2168,54 @@ GetHloBufferSlices(const HloInstruction* hlo,
       -> optional<std::pair<BufferAllocation::Slice, ShapeIndex>> {
     // Simple, common case: Is the buffer for instr known at runtime?  If so,
     // we're done.
-    auto slice = GetKnownAtRuntimeSlice(instr, index, buffer_assn);
-    if (slice.has_value()) {
-      return {{*slice, ShapeIndex()}};
+    auto slice = buffer_assn.GetUniqueSlice(instr, index);
+    if (slice.ok()) {
+      return {{slice.ValueOrDie(), ShapeIndex()}};
     }
 
-    // If we don't know the buffer for instr at index, see if we know the buffer
-    // for instr at index without its last element.  If so, we can dynamically
-    // find the buffer for instr by dereferencing a pointer in that buffer.
-    // Continue looking this way until we run out of elements in 'index'.
-    ShapeIndex new_index = index;
-    ShapeIndex gte_indices;
-    while (!new_index.empty()) {
-      gte_indices.push_front(new_index.back());
-      new_index.pop_back();
-      auto slice = GetKnownAtRuntimeSlice(instr, new_index, buffer_assn);
-      if (slice.has_value()) {
-        return {{*slice, gte_indices}};
+    // If that didn't work, walk up any bitcasts that we might see.  These must
+    // appear before any GTE instructions, because it's illegal to bitcast to a
+    // tuple type.
+    const HloInstruction* parent = instr;
+    while (parent->opcode() == HloOpcode::kBitcast) {
+      parent = parent->operand(0);
+
+      auto slice = buffer_assn.GetUniqueSlice(parent, {});
+      if (slice.ok()) {
+        return {{slice.ValueOrDie(), ShapeIndex()}};
       }
     }
 
-    // If *that* didn't work, check whether instr is a GTE instruction.  If it
-    // is, see if we can get a buffer for its parent, and continue walking up
-    // parents until we find a defined buffer or we hit something that's not a
-    // GTE.
-    const HloInstruction* parent = instr;
+    // Check whether instr is a GTE instruction.  If it is, see if we can get a
+    // buffer for its parent, and continue walking up parents until we find a
+    // defined buffer or we hit something that's not a GTE.
+    ShapeIndex gte_indices;
     while (parent->opcode() == HloOpcode::kGetTupleElement) {
       gte_indices.push_front(parent->tuple_index());
       parent = parent->operand(0);
 
-      auto slice = GetKnownAtRuntimeSlice(parent, {}, buffer_assn);
-      if (slice.has_value()) {
-        return {{*slice, gte_indices}};
+      auto slice = buffer_assn.GetUniqueSlice(parent, {});
+      if (slice.ok()) {
+        return {{slice.ValueOrDie(), gte_indices}};
+      }
+    }
+
+    // Finally, if we don't know the buffer for instr at index, see if we know
+    // the buffer for instr at index without its last element.  If so, we can
+    // dynamically find the buffer for instr by dereferencing a pointer in that
+    // buffer.  Continue looking this way until we run out of elements in
+    // 'index'.
+    //
+    // We can almost always get a buffer without resorting to this.  The only
+    // exception is for cases where the relevant sub-buffer is truly unknowable,
+    // for example the sub-buffer of a tuple-shaped select.
+    ShapeIndex new_index = index;
+    while (!new_index.empty()) {
+      gte_indices.push_front(new_index.back());
+      new_index.pop_back();
+      auto slice = buffer_assn.GetUniqueSlice(instr, new_index);
+      if (slice.ok()) {
+        return {{slice.ValueOrDie(), gte_indices}};
       }
     }
 
@@ -2069,8 +2260,8 @@ Status IrEmitterUnnested::HandleGather(HloInstruction* gather) {
   return Unimplemented("Gather is not implemented on GPUs.");
 }
 
-std::unique_ptr<Thunk> IrEmitterUnnested::BuildKernelThunk(
-    const HloInstruction* inst) {
+std::unique_ptr<KernelThunk> IrEmitterUnnested::BuildKernelThunk(
+    const HloInstruction* inst, int unroll_factor) {
   const BufferAssignment& buffer_assn =
       ir_emitter_context_->buffer_assignment();
 
@@ -2162,7 +2353,7 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildKernelThunk(
   }
 
   return MakeUnique<KernelThunk>(buffers, llvm_ir::AsString(kernel->getName()),
-                                 inst);
+                                 inst, unroll_factor);
 }
 
 std::unique_ptr<Thunk> IrEmitterUnnested::BuildHostToDeviceCopyThunk(
@@ -2207,6 +2398,21 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildInfeedThunk(
       /*destination_buffer=*/GetAllocationSlice(*inst), inst);
 }
 
+namespace {
+double GetScalarConstantAsDouble(const Literal& literal) {
+  switch (literal.shape().element_type()) {
+    case F16:
+      return static_cast<double>(literal.Get<Eigen::half>({}));
+    case F32:
+      return literal.Get<float>({});
+    case F64:
+      return literal.Get<double>({});
+    default:
+      LOG(FATAL) << "Unsupported type.";
+  }
+}
+}  // namespace
+
 std::unique_ptr<Thunk> IrEmitterUnnested::BuildGemmThunk(
     const HloInstruction* inst) {
   if (inst->opcode() == HloOpcode::kDot) {
@@ -2219,13 +2425,29 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildGemmThunk(
         lhs->shape(),               // The shape of LHS.
         rhs->shape(),               // The shape of RHS.
         inst->shape(),              // The shape of the output.
-        false,                      // Do not transpose LHS.
-        false,                      // Do not transpose RHS.
+        1.0,                        // alpha.
         inst);
   }
 
   if (inst->opcode() == HloOpcode::kFusion) {
-    const HloInstruction* dot = inst->fused_expression_root();
+    CHECK_EQ(inst->fusion_kind(), HloInstruction::FusionKind::kOutput);
+    const HloInstruction* mul = inst->fused_expression_root();
+    const HloInstruction* dot = mul->operand(0);
+    const HloInstruction* alpha = mul->operand(1);
+    if (dot->opcode() != HloOpcode::kDot) {
+      std::swap(dot, alpha);
+    }
+    if (alpha->opcode() == HloOpcode::kBroadcast) {
+      alpha = alpha->operand(0);
+    }
+    alpha = inst->operand(alpha->parameter_number());
+    // TODO(b/74185543): Remove the following if block once we support fusion
+    // with a non-constant as well. Then we will just always use the constant
+    // on the device.
+    if (alpha->opcode() == HloOpcode::kCopy) {
+      alpha = alpha->operand(0);
+    }
+
     DCHECK(dot->opcode() == HloOpcode::kDot);
     const HloInstruction* lhs_parameter = StripTranspose(*dot->operand(0));
     const HloInstruction* rhs_parameter = StripTranspose(*dot->operand(1));
@@ -2237,14 +2459,13 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildGemmThunk(
         inst->operand(rhs_parameter->parameter_number());
 
     return MakeUnique<GemmThunk>(
-        GetAllocationSlice(*lhs),             // The buffer assigned to LHS.
-        GetAllocationSlice(*rhs),             // The buffer assigned to RHS.
-        GetAllocationSlice(*inst),            // The output buffer.
-        lhs->shape(),                         // The shape of LHS.
-        rhs->shape(),                         // The shape of RHS.
-        inst->shape(),                        // The shape of the output.
-        dot->operand(0)->IsRank2Transpose(),  // Transpose LHS.
-        dot->operand(1)->IsRank2Transpose(),  // Trasnpose RHS.
+        GetAllocationSlice(*lhs),   // The buffer assigned to LHS.
+        GetAllocationSlice(*rhs),   // The buffer assigned to RHS.
+        GetAllocationSlice(*inst),  // The output buffer.
+        lhs->shape(),               // The shape of LHS.
+        rhs->shape(),               // The shape of RHS.
+        inst->shape(),              // The shape of the output.
+        GetScalarConstantAsDouble(alpha->literal()),  // alpha.
         inst);
   }
 
@@ -2261,37 +2482,101 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildFftThunk(
                               /*output_shape=*/inst->shape(), inst);
 }
 
-Status IrEmitterUnnested::EmitInitializer(const HloInstruction* hlo,
-                                          KernelThunk* thunk) {
+StatusOr<std::unique_ptr<Thunk>> IrEmitterUnnested::BuildInitializerThunk(
+    const HloInstruction* hlo, const ShapeIndex& index) {
   bool fused = HloOpcode::kFusion == hlo->opcode();
-
   const HloInstruction* inst = fused ? hlo->fused_expression_root() : hlo;
-  CHECK(inst->opcode() == HloOpcode::kSelectAndScatter ||
-        inst->opcode() == HloOpcode::kReduce);
-  const HloInstruction* init_value = nullptr;
-  switch (inst->opcode()) {
-    case HloOpcode::kSelectAndScatter:
-      init_value = inst->operand(2);
-      break;
-    case HloOpcode::kReduce:
-      init_value = inst->operand(1);
-      break;
-    default:
-      LOG(FATAL) << "Opcode " << inst->opcode()
-                 << " should not need an initializer.";
-  }
+  const HloInstruction* init_value = [&] {
+    switch (inst->opcode()) {
+      case HloOpcode::kSelectAndScatter:
+        return inst->operand(2);
+      case HloOpcode::kReduce:
+        return inst->operand(1);
+      case HloOpcode::kTuple:
+        CHECK(hlo->IsMultiOutputFusion())
+            << ": " << hlo->ToString() << " is not a multi-output fusion.";
+        CHECK(inst->operand(index.back())->opcode() == HloOpcode::kReduce)
+            << ": Found '" << inst->operand(index.back())->opcode() << "' in "
+            << inst->ToString() << " but expected 'reduce'.";
+        // For multi-output fusion look through the tuple.
+        return inst->operand(index.back())->operand(1);
+      default:
+        LOG(FATAL) << "Opcode " << inst->opcode()
+                   << " should not need an initializer.";
+    }
+  }();
 
   if (fused && init_value->opcode() == HloOpcode::kParameter) {
     init_value = hlo->operand(init_value->parameter_number());
   }
 
-  return EmitTargetElementLoopInThunk(
-      *hlo,
-      [=](const llvm_ir::IrArray::Index& index) {
-        return GetIrArray(*init_value, *hlo)
-            .EmitReadArrayElement(index, &ir_builder_);
-      },
-      thunk);
+  // In the common case, the initializer is a constant.  In this case, emit a
+  // device-memset call if we can.  Currently StreamExecutor only supports
+  // zeroing and 32-bit memsets.
+  if (init_value->IsConstant()) {
+    CHECK(ShapeUtil::IsScalar(init_value->shape()));
+    int64 num_bytes = ShapeUtil::ByteSizeOfElements(init_value->shape());
+    const auto& literal = init_value->literal();
+
+    // Are all the bytes of this scalar equal to 0?  If so, we can create a
+    // MemzeroThunk.
+    ArraySlice<uint8> literal_bytes(
+        reinterpret_cast<const uint8*>(literal.untyped_data()), num_bytes);
+    if (c_all_of(literal_bytes, [](uint8 byte) { return byte == 0; })) {
+      return {MakeUnique<MemzeroThunk>(GetAllocationSlice(*hlo, index), hlo)};
+    }
+
+    // If the literal is 8 or 16 bits wide, we can emit a 32-bit memset by
+    // repeating the literal 4 or 2 times, so long as the destination buffer is
+    // an even multiple of 32 bits long.
+    if ((num_bytes == 1 || num_bytes == 2) &&
+        ShapeUtil::ByteSizeOf(hlo->shape()) % 4 == 0) {
+      uint16 pattern16;
+      if (num_bytes == 1) {
+        uint8 b = literal_bytes.front();
+        pattern16 = uint16{b} | (uint16{b} << 8);
+      } else {
+        pattern16 = literal_bytes.front();
+      }
+      uint32 pattern32 = uint32{pattern16} | (uint32{pattern16} << 16);
+      return {MakeUnique<Memset32BitValueThunk>(
+          pattern32, GetAllocationSlice(*hlo, index), hlo)};
+    }
+
+    // If the literal is an even multiple of 32 bits wide, we can emit a 32-bit
+    // memset so long as all 32-bit words of the scalar are equal to each other.
+    if (num_bytes >= 4 && num_bytes % 4 == 0 &&
+        memcmp(literal_bytes.data(), literal_bytes.data() + 4,
+               literal_bytes.size() - 4) == 0) {
+      uint32 word;
+      memcpy(&word, literal_bytes.data(), sizeof(word));
+      return {MakeUnique<Memset32BitValueThunk>(
+          word, GetAllocationSlice(*hlo, index), hlo)};
+    }
+  }
+
+  // Otherwise fall back to our slow initializer code.
+  std::unique_ptr<KernelThunk> kernel_thunk = BuildKernelThunk(hlo);
+  LaunchDimensions launch_dimensions =
+      CalculateLaunchDimensions(ShapeUtil::GetSubshape(hlo->shape(), index),
+                                ir_emitter_context_->device_description());
+  UpdateLaunchDimensions(launch_dimensions, kernel_thunk.get(),
+                         ir_emitter_context_->llvm_module());
+  TF_RETURN_IF_ERROR(ParallelLoopEmitter(
+                         [=](const llvm_ir::IrArray::Index& index) {
+                           return GetIrArray(*init_value, *hlo)
+                               .EmitReadArrayElement(index, &ir_builder_);
+                         },
+                         GetIrArray(*hlo, *hlo, index), launch_dimensions,
+                         &ir_builder_)
+                         .EmitLoop(IrName(hlo)));
+
+  // Clean up state left behind by emitting the loop above.  (This is normally
+  // done in IrEmitterUnnested::Postprocess().)
+  bindings_.UnbindAllLocalIrValues();
+
+  // Convert unique_ptr<KernelThunk> to StatusOr<unique_ptr<Thunk>>.
+  return {std::move(kernel_thunk)};
 }
 
 namespace {
@@ -2452,18 +2737,22 @@ std::unique_ptr<Thunk> IrEmitterUnnested::BuildConditionalThunk(
 Status IrEmitterUnnested::EmitTargetElementLoopInThunk(
     const HloInstruction& hlo,
     const llvm_ir::ElementGenerator& element_generator, KernelThunk* thunk) {
+  int unroll_factor = thunk->unroll_factor();
   VLOG(3) << bindings_.ToString();
 
   const Shape& element_shape = hlo.IsMultiOutputFusion()
                                    ? ShapeUtil::GetSubshape(hlo.shape(), {0})
                                    : hlo.shape();
+  VLOG(3) << "EmitTargetElementLoopInThunk "
+          << ShapeUtil::HumanStringWithLayout(hlo.shape())
+          << " for unroll_factor " << unroll_factor;
   LaunchDimensions launch_dimensions = CalculateLaunchDimensions(
-      element_shape, ir_emitter_context_->device_description());
+      element_shape, ir_emitter_context_->device_description(), unroll_factor);
   UpdateLaunchDimensions(launch_dimensions, thunk,
                          ir_emitter_context_->llvm_module());
   if (!hlo.IsMultiOutputFusion()) {
     return ParallelLoopEmitter(element_generator, GetIrArray(hlo, hlo),
-                               launch_dimensions, &ir_builder_)
+                               launch_dimensions, &ir_builder_, unroll_factor)
         .EmitLoop(IrName(&hlo));
   }
 
@@ -2473,7 +2762,8 @@ Status IrEmitterUnnested::EmitTargetElementLoopInThunk(
     output_arrays.push_back(GetIrArray(hlo, hlo, {i}));
   }
   TF_RETURN_IF_ERROR(ParallelLoopEmitter(element_generator, output_arrays,
-                                         launch_dimensions, &ir_builder_)
+                                         launch_dimensions, &ir_builder_,
+                                         unroll_factor)
                          .EmitLoop(IrName(&hlo)));
 
   std::vector<llvm::Value*> tuple_operand_ptrs;

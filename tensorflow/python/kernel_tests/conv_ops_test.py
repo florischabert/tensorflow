@@ -159,11 +159,11 @@ class Conv2DTest(test.TestCase):
 
   def _DtypesToTest(self, use_gpu):
     if use_gpu and not test_util.CudaSupportsHalfMatMulAndConv():
-      return [dtypes.float32]
+      return [dtypes.float32, dtypes.float64]
     else:
       # It is important that float32 comes before float16 here,
       # as we will be using its gradients as reference for fp16 gradients.
-      return [dtypes.float32, dtypes.float16]
+      return [dtypes.float32, dtypes.float16, dtypes.float64]
 
   def _SetupValuesForDevice(self, tensor_in_sizes, filter_in_sizes, dilations,
                             strides, padding, data_format, dtype, use_gpu):
@@ -312,8 +312,8 @@ class Conv2DTest(test.TestCase):
       expected_values = self.evaluate(expected_results)
       computed_values = self.evaluate(computed_results)
       for e_value, c_value in zip(expected_values, computed_values):
-        print("expected = ", e_value)
-        print("actual = ", c_value)
+        tf_logging.info("expected = ", e_value)
+        tf_logging.info("actual = ", c_value)
         self.assertAllClose(
             e_value.flatten(), c_value.flatten(), atol=tolerance, rtol=1e-4)
 
@@ -337,8 +337,8 @@ class Conv2DTest(test.TestCase):
       for i in range(len(tensors)):
         conv = tensors[i]
         value = values[i]
-        print("expected = ", expected)
-        print("actual = ", value)
+        tf_logging.info("expected = ", expected)
+        tf_logging.info("actual = ", value)
         tol = 1e-5
         if value.dtype == np.float16:
           tol = 1e-3
@@ -547,8 +547,8 @@ class Conv2DTest(test.TestCase):
       # "values" consists of two tensors for two backprops
       value = self.evaluate(conv)
       self.assertShapeEqual(value, conv)
-    print("expected = ", expected)
-    print("actual = ", value)
+    tf_logging.info("expected = ", expected)
+    tf_logging.info("actual = ", value)
     self.assertArrayNear(expected, value.flatten(), err)
 
   def _CompareBackpropInput(self, input_sizes, filter_sizes, output_sizes,
@@ -723,8 +723,8 @@ class Conv2DTest(test.TestCase):
             data_format=data_format)
         value = self.evaluate(conv)
         self.assertShapeEqual(value, conv)
-      print("expected = ", expected)
-      print("actual = ", value)
+      tf_logging.info("expected = ", expected)
+      tf_logging.info("actual = ", value)
       self.assertArrayNear(expected, value.flatten(), 1e-5)
 
   def _CompareBackFilter(self, input_sizes, filter_sizes, output_sizes,
@@ -912,8 +912,8 @@ class Conv2DTest(test.TestCase):
         value_2 = sess.run(conv_2)
         self.assertShapeEqual(value, conv)
         self.assertShapeEqual(value_2, conv_2)
-      print("expected = ", value_2)
-      print("actual = ", value)
+      tf_logging.info("expected = ", value_2)
+      tf_logging.info("actual = ", value)
       self.assertArrayNear(value_2.flatten(), value.flatten(), err)
 
   # Testing for backprops
@@ -965,12 +965,12 @@ class Conv2DTest(test.TestCase):
         value_2 = sess.run(conv_2)
         self.assertShapeEqual(value, conv)
         self.assertShapeEqual(value_2, conv_2)
-      print("expected = ", value_2)
-      print("actual = ", value)
+      tf_logging.info("expected = ", value_2)
+      tf_logging.info("actual = ", value)
       self.assertArrayNear(value_2.flatten(), value.flatten(), err)
 
   def testConv2D2x2Depth3ValidBackpropFilterStride1x1Dilation2x1(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropFilterDilation(
             input_sizes=[1, 3, 6, 1],
@@ -984,7 +984,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2D2x2Depth1ValidBackpropFilterDilation1x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropFilterDilation(
             input_sizes=[1, 2, 3, 1],
@@ -998,7 +998,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2DEmptyBackpropFilterDilation1x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropFilterDilation(
             input_sizes=[1, 2, 3, 1],
@@ -1012,7 +1012,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2D2x2Depth3ValidBackpropFilterDilation2x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropFilterDilation(
             input_sizes=[1, 3, 4, 3],
@@ -1026,7 +1026,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2DKernelSizeMatchesInputSizeBackpropFilterDilation2x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropFilterDilation(
             input_sizes=[1, 3, 3, 1],
@@ -1040,7 +1040,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2D2x2Depth3ValidBackpropInputStride1x1Dilation2x1(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropInputDilation(
             input_sizes=[1, 3, 6, 1],
@@ -1054,7 +1054,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2D2x2Depth1ValidBackpropInputDilation1x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropInputDilation(
             input_sizes=[1, 2, 3, 1],
@@ -1068,7 +1068,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2DEmptyBackpropInputDilation1x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropInputDilation(
             input_sizes=[0, 2, 3, 1],
@@ -1082,7 +1082,7 @@ class Conv2DTest(test.TestCase):
             err=1e-5)
 
   def testConv2D2x2Depth3ValidBackpropInputDilation2x1(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         # The GPU version of this test is not very stable. So adjusting the
         # error threshold to 1e-4.
@@ -1098,7 +1098,7 @@ class Conv2DTest(test.TestCase):
             err=1e-4)
 
   def testConv2DKernelSizeMatchesInputSizeBackpropInputDilation2x2(self):
-    if test.is_gpu_available(cuda_only=True):
+    if test.is_gpu_available(cuda_only=True) or test_util.IsMklEnabled():
       for (data_format, use_gpu) in GetTestConfigs():
         self._RunAndVerifyBackpropInputDilation(
             input_sizes=[1, 3, 3, 1],
@@ -1178,7 +1178,7 @@ class Conv2DTest(test.TestCase):
           # since fp16 numerical gradients are too imprecise.
           err = np.fabs(jacob_t - reference_jacob_t).max()
 
-        print("conv_2d gradient error = ", err)
+        tf_logging.info("conv_2d gradient error = ", err)
         self.assertLess(err, 0.002)
 
   def testInputGradientValidPaddingStrideOne(self):
@@ -1546,7 +1546,7 @@ class DepthwiseConv2DTest(test.TestCase):
       conv = nn_impl.depthwise_conv2d(
           t1, t2, strides=[1, stride, stride, 1], padding=padding)
       value = sess.run(conv)
-    print("value = ", value)
+    tf_logging.info("value = ", value)
     self.assertArrayNear(expected, np.ravel(value), 1e-5)
     self.assertShapeEqual(value, conv)
 
@@ -1668,7 +1668,7 @@ class SeparableConv2DTest(test.TestCase):
         conv = array_ops.transpose(conv, [0, 2, 3, 1])
 
       value = sess.run(conv)
-    print("value = ", value)
+    tf_logging.info("value = ", value)
     self.assertArrayNear(expected, np.ravel(value), 1e-5)
     self.assertShapeEqual(value, conv)
 
@@ -1826,7 +1826,7 @@ class Conv2DBenchmark(test.Benchmark):
         wall_time = time.time() - start
         self.report_benchmark(
             name="conv_stack_iter_%d" % iter_index, wall_time=wall_time)
-        print("conv_stack_iter_%d: %.4f" % (iter_index, wall_time))
+        tf_logging.info("conv_stack_iter_%d: %.4f" % (iter_index, wall_time))
 
 
 def GetInceptionFwdTest(input_size, filter_size, stride, padding,

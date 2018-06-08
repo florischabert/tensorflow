@@ -24,15 +24,16 @@ extern "C" {
 #endif  // __cplusplus
 
 // The enum for builtin operators.
-// Note: CUSTOM and DELEGATE are 2 special ops which are not real biultin
-// ops.
+// Note: CUSTOM and DELEGATE are 2 special ops which are not real built-in ops.
 typedef enum {
   kTfLiteBuiltinAdd = 0,
   kTfLiteBuiltinAveragePool2d = 1,
   kTfLiteBuiltinConcatenation = 2,
   kTfLiteBuiltinConv2d = 3,
   kTfLiteBuiltinDepthwiseConv2d = 4,
+  kTfLiteBuiltinDequantize = 6,
   kTfLiteBuiltinEmbeddingLookup = 7,
+  kTfLiteBuiltinFloor = 8,
   kTfLiteBuiltinFullyConnected = 9,
   kTfLiteBuiltinHashtableLookup = 10,
   kTfLiteBuiltinL2Normalization = 11,
@@ -77,10 +78,29 @@ typedef enum {
   kTfLiteBuiltinLogSoftmax = 50,
   kTfLiteBuiltinDelegate = 51,
   kTfLiteBuiltinBidirectionalSequenceLstm = 52,
+  kTfLiteBuiltinCast = 53,
+  kTfLiteBuiltinPrelu = 54,
+  kTfLiteBuiltinMaximum = 55,
+  kTfLiteBuiltinArgMax = 56,
+  kTfLiteBuiltinMinimum = 57,
+  kTfLiteBuiltinLess = 58,
+  kTfLiteBuiltinNeg = 59,
+  kTfLiteBuiltinPadv2 = 60,
+  kTfLiteBuiltinGreater = 61,
+  kTfLiteBuiltinGreaterEqual = 62,
+  kTfLiteBuiltinLessEqual = 63,
+  kTfLiteBuiltinSelect = 64,
+  kTfLiteBuiltinSlice = 65,
+  kTfLiteBuiltinSin = 66,
+  kTfLiteBuiltinTransposeConv = 67,
+  kTfLiteBuiltinSparseToDense = 68,
+  kTfLiteBuiltinTile = 69,
+  kTfLiteBuiltinExpandDims = 70,
+  kTfLiteBuiltinEqual = 71,
+  kTfLiteBuiltinNotEqual = 72,
 } TfLiteBuiltinOperator;
 
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
 #endif  // TENSORFLOW_CONTRIB_LITE_BUILTIN_OPS_H_
-}

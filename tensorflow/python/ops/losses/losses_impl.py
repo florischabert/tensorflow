@@ -29,6 +29,7 @@ from tensorflow.python.ops import nn_ops
 from tensorflow.python.ops import weights_broadcast_ops
 from tensorflow.python.ops.losses import util
 from tensorflow.python.util.deprecation import deprecated_args
+from tensorflow.python.util.deprecation import deprecated_argument_lookup
 from tensorflow.python.util.tf_export import tf_export
 
 
@@ -89,14 +90,6 @@ def _safe_div(numerator, denominator, name="value"):
   Returns:
     The element-wise value of the numerator divided by the denominator.
   """
-  if isinstance(denominator, float):
-    if math_ops.equal(denominator, 0.0):
-      return ops.convert_to_tensor(0.0, dtype=numerator.dtype)
-    return math_ops.div(numerator, denominator)
-  if context.in_eager_mode() and denominator._rank() == 0:  # pylint: disable=protected-access
-    if math_ops.equal(denominator, 0.0):
-      return ops.convert_to_tensor(0.0, dtype=numerator.dtype)
-    return math_ops.div(numerator, denominator)
   return array_ops.where(
       math_ops.greater(denominator, 0),
       math_ops.div(numerator, array_ops.where(
@@ -144,7 +137,7 @@ def _num_present(losses, weights, per_batch=False):
       `[batch_size]`. Otherwise, a single scalar tensor is returned.
   """
   if ((isinstance(weights, float) and weights != 0.0) or
-      (context.in_eager_mode() and weights._rank() == 0  # pylint: disable=protected-access
+      (context.executing_eagerly() and weights._rank() == 0  # pylint: disable=protected-access
        and not math_ops.equal(weights, 0.0))):
     return _num_elements(losses)
   with ops.name_scope(None, "num_present", (losses, weights)) as scope:
@@ -202,6 +195,11 @@ def compute_weighted_loss(
   """
   Reduction.validate(reduction)
   with ops.name_scope(scope, "weighted_loss", (losses, weights)):
+    # Save the `reduction` argument for loss normalization when distributing
+    # to multiple towers.
+    # TODO(josh11b): Associate it with the returned op for more precision.
+    ops.get_default_graph()._last_loss_reduction = reduction  # pylint: disable=protected-access
+
     with ops.control_dependencies((
         weights_broadcast_ops.assert_broadcastable(weights, losses),)):
       losses = ops.convert_to_tensor(losses)
@@ -309,11 +307,8 @@ def cosine_distance(
     ValueError: If `predictions` shape doesn't match `labels` shape, or
       `axis`, `labels`, `predictions` or `weights` is `None`.
   """
-  if dim is not None:
-    if axis is not None:
-      raise ValueError("Cannot specify both 'axis' and 'dim'")
-    axis = dim
-  if axis is None and dim is None:
+  axis = deprecated_argument_lookup("axis", axis, "dim", dim)
+  if axis is None:
     raise ValueError("You must specify 'axis'.")
   if labels is None:
     raise ValueError("labels must not be None.")
@@ -339,8 +334,11 @@ def hinge_loss(labels, logits, weights=1.0, scope=None,
 
   Args:
     labels: The ground truth output tensor. Its shape should match the shape of
-      logits. The values of the tensor are expected to be 0.0 or 1.0.
-    logits: The logits, a float tensor.
+      logits. The values of the tensor are expected to be 0.0 or 1.0. Internally
+      the {0,1} labels are converted to {-1,1} when calculating the hinge loss.
+    logits: The logits, a float tensor. Note that logits are assumed to be
+      unbounded and 0-centered. A value > 0 (resp. < 0) is considered a positive
+      (resp. negative) binary prediction.
     weights: Optional `Tensor` whose rank is either 0, or the same rank as
       `labels`, and must be broadcastable to `labels` (i.e., all dimensions must
       be either `1`, or the same as the corresponding `losses` dimension).
@@ -699,7 +697,7 @@ def softmax_cross_entropy(
     onehot_labels, logits, weights=1.0, label_smoothing=0, scope=None,
     loss_collection=ops.GraphKeys.LOSSES,
     reduction=Reduction.SUM_BY_NONZERO_WEIGHTS):
-  """Creates a cross-entropy loss using tf.nn.softmax_cross_entropy_with_logits.
+  """Creates a cross-entropy loss using tf.nn.softmax_cross_entropy_with_logits_v2.
 
   `weights` acts as a coefficient for the loss. If a scalar is provided,
   then the loss is simply scaled by the given value. If `weights` is a
@@ -710,11 +708,16 @@ def softmax_cross_entropy(
       new_onehot_labels = onehot_labels * (1 - label_smoothing)
                           + label_smoothing / num_classes
 
+  Note that `onehot_labels` and `logits` must have the same shape,
+  e.g. `[batch_size, num_classes]`. The shape of `weights` must be
+  broadcastable to loss, whose shape is decided by the shape of `logits`.
+  In case the shape of `logits` is `[batch_size, num_classes]`, loss is
+  a `Tensor` of shape `[batch_size]`.
+
   Args:
-    onehot_labels: `[batch_size, num_classes]` target one-hot-encoded labels.
-    logits: `[batch_size, num_classes]` logits outputs of the network .
-    weights: Optional `Tensor` whose rank is either 0, or rank 1 and is
-      broadcastable to the loss which is a `Tensor` of shape `[batch_size]`.
+    onehot_labels: One-hot-encoded labels.
+    logits: Logits outputs of the network.
+    weights: Optional `Tensor` that is broadcastable to loss.
     label_smoothing: If greater than 0 then smooth the labels.
     scope: the scope for the operations performed in computing the loss.
     loss_collection: collection to which the loss will be added.
